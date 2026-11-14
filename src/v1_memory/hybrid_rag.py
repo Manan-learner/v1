@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import re
 import zlib
 from typing import Iterable, Sequence
 
-from v1_memory.text_utils import tokenize_domain
+from v1_memory.text_utils import STOPWORDS, split_alnum_parts, stem_token, tokenize_domain
 
 VECTOR_DIM = 256
+VECTOR_CACHE_VERSION = "2.2"
+CACHE_VERSION = VECTOR_CACHE_VERSION
 
 DEFAULT_CONCEPT_CLUSTERS: dict[str, list[str]] = {
     "rf_telemetry": [
@@ -32,25 +36,30 @@ DEFAULT_CONCEPT_CLUSTERS: dict[str, list[str]] = {
         "telemetry",
         "rssi",
         "snr",
-        "link",
+        "dbm",
         "dropout",
         "dropouts",
-        "packet",
-        "packets",
-        "framing",
         "preamble",
-        "crc",
         "transceiver",
         "wireless",
         "antenna",
         "modulation",
         "spreading",
         "bandwidth",
-        "dbm",
-        "signal",
-        "mavlink",
+        "airtime",
+        "crc",
+        "fsk",
+        "sf7",
+        "sf9",
+        "sf12",
+        "esp-now",
+        "espnow",
+        "crsf",
+        "elrs",
+        "downlink",
+        "uplink",
     ],
-    "can_embedded": [
+    "mcu_embedded": [
         "mcu",
         "embedded",
         "stm32",
@@ -58,15 +67,12 @@ DEFAULT_CONCEPT_CLUSTERS: dict[str, list[str]] = {
         "stm32f4",
         "stm32g4",
         "esp32",
+        "esp32s3",
         "fdcan",
-        "can",
-        "canbus",
         "bxcan",
+        "canbus",
         "prescaler",
         "arbitration",
-        "bit",
-        "timing",
-        "nominal",
         "bootloader",
         "firmware",
         "uart",
@@ -74,23 +80,67 @@ DEFAULT_CONCEPT_CLUSTERS: dict[str, list[str]] = {
         "spi",
         "i2c",
         "dma",
+        "isr",
+        "interrupt",
         "hal",
-        "clock",
-        "peripheral",
+        "gpio",
+        "pwm",
+        "watchdog",
+        "rtos",
+        "freertos",
+        "zephyr",
         "microcontroller",
-        "frame",
-        "frames",
-        "retry",
-        "timeout",
+        "peripheral",
+        "baud",
+        "baudrate",
+        "bitrate",
+    ],
+    "uav_mavlink": [
+        "mavlink",
+        "uav",
+        "drone",
+        "px4",
+        "ardupilot",
+        "autopilot",
+        "sitl",
+        "gazebo",
+        "waypoint",
+        "waypoints",
+        "gimbal",
+        "offboard",
+        "attitude",
+        "imu",
+        "gps",
+        "ekf",
+        "quadcopter",
+        "flight",
+        "airspeed",
+        "altimeter",
+    ],
+    "rag_search": [
+        "rag",
+        "hybrid_rag",
+        "rrf",
+        "bm25",
+        "fts",
+        "fts5",
+        "vector",
+        "embedding",
+        "embeddings",
+        "semantic",
+        "cosine",
+        "retrieval",
+        "rerank",
+        "reranker",
     ],
     "k8s_containers": [
         "kubernetes",
         "k8s",
         "helm",
-        "chart",
         "pod",
         "pods",
         "deployment",
+        "deployments",
         "liveness",
         "readiness",
         "probe",
@@ -100,39 +150,34 @@ DEFAULT_CONCEPT_CLUSTERS: dict[str, list[str]] = {
         "containers",
         "docker",
         "dockerfile",
+        "compose",
         "ingress",
         "namespace",
         "kubectl",
-        "cluster",
         "autoscale",
         "hpa",
     ],
     "auth_security": [
-        "auth",
-        "authentication",
-        "authorization",
+        "jwt",
         "oauth",
         "oauth2",
         "oidc",
-        "jwt",
-        "token",
-        "tokens",
-        "credentials",
-        "credential",
-        "session",
-        "sessions",
         "sso",
-        "login",
-        "apikey",
-        "api_key",
-        "secret",
-        "secrets",
         "rbac",
         "iam",
-        "permission",
-        "permissions",
-        "cookie",
-        "refresh",
+        "apikey",
+        "api_key",
+        "authentication",
+        "authorization",
+        "auth",
+        "credential",
+        "credentials",
+        "login",
+        "secret",
+        "secrets",
+        "tls",
+        "ssl",
+        "certificate",
     ],
     "database_storage": [
         "database",
@@ -141,9 +186,6 @@ DEFAULT_CONCEPT_CLUSTERS: dict[str, list[str]] = {
         "sqlite",
         "sqlite3",
         "wal",
-        "fts",
-        "fts5",
-        "bm25",
         "schema",
         "migration",
         "migrations",
@@ -152,41 +194,30 @@ DEFAULT_CONCEPT_CLUSTERS: dict[str, list[str]] = {
         "bigquery",
         "spanner",
         "transaction",
+        "transactions",
         "vacuum",
-    ],
-    "rag_search": [
-        "rag",
-        "hybrid_rag",
-        "rrf",
-        "bm25",
-        "fts5",
-        "vector",
-        "embedding",
-        "embeddings",
-        "semantic",
-        "cosine",
+        "duckdb",
+        "mysql",
+        "nosql",
+        "orm",
     ],
     "cloud_backup_sync": [
         "cloud",
         "drive",
         "gdrive",
-        "google",
+        "google-drive",
         "rclone",
         "backup",
         "backups",
         "restore",
         "sync",
+        "syncing",
         "synchronization",
-        "mirror",
-        "archive",
-        "archives",
+        "robocopy",
         "storage",
         "bucket",
         "gcs",
         "s3",
-        "upload",
-        "download",
-        "snapshot",
     ],
 }
 
@@ -197,17 +228,7 @@ DEFAULT_SYNONYMS = DEFAULT_CONCEPT_CLUSTERS
 _FASTEMBED_MODEL = None
 _FASTEMBED_FAILED = False
 _DEFAULT_LOOKUP_CACHE: tuple[dict[str, list[str]], dict[str, set[str]]] | None = None
-
-
-def _stem_token(tok: str) -> str:
-    t = tok.lower().strip("._-")
-    if len(t) > 4 and t.endswith("ies"):
-        return t[:-3] + "y"
-    if len(t) > 4 and t.endswith("es") and not t.endswith(("ses", "xes", "zes")):
-        return t[:-1]
-    if len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
-        return t[:-1]
-    return t
+_stem_token = stem_token
 
 
 def _build_term_index(clusters: dict[str, list[str]]) -> dict[str, set[str]]:
@@ -218,7 +239,7 @@ def _build_term_index(clusters: dict[str, list[str]]) -> dict[str, set[str]]:
             if not t_low:
                 continue
             term_to_concepts.setdefault(t_low, set()).add(cid)
-            term_to_concepts.setdefault(_stem_token(t_low), set()).add(cid)
+            term_to_concepts.setdefault(stem_token(t_low), set()).add(cid)
     return term_to_concepts
 
 
@@ -244,7 +265,10 @@ def build_concept_lookup(
         expanded_terms: list[str] = []
         for term in terms:
             expanded_terms.append(term)
-            expanded_terms.extend(tokenize_domain(term))
+            if " " in term:
+                expanded_terms.extend(tokenize_domain(term))
+            else:
+                expanded_terms.extend(split_alnum_parts(term))
         deduped = list(dict.fromkeys(t for t in expanded_terms if t))
         if slug in clusters:
             clusters[slug] = list(dict.fromkeys(clusters[slug] + deduped))
@@ -266,7 +290,7 @@ def group_tokens_by_concept(
         tok = str(raw).lower().strip()
         if not tok:
             continue
-        cids = term_to_concepts.get(tok, set()) | term_to_concepts.get(_stem_token(tok), set())
+        cids = term_to_concepts.get(tok, set()) | term_to_concepts.get(stem_token(tok), set())
         for cid in sorted(cids):
             key = f"concept:{cid}"
             seen = seen_per_concept.setdefault(key, set())
@@ -274,6 +298,49 @@ def group_tokens_by_concept(
                 seen.add(tok)
                 grouped.setdefault(key, []).append(tok)
     return grouped
+
+
+def qualifying_shared_concepts(
+    q_concept_hits: dict[str, list[str]],
+    doc_concept_hits: dict[str, list[str]],
+    min_distinct_stems: int = 2,
+) -> dict[str, tuple[list[str], list[str]]]:
+    """Return shared concept IDs with >= min_distinct_stems in both query and doc after lemmatization."""
+    shared: dict[str, tuple[list[str], list[str]]] = {}
+    for concept_id, q_hits in q_concept_hits.items():
+        d_hits = doc_concept_hits.get(concept_id)
+        if not d_hits:
+            continue
+        q_stems = {stem_token(t) for t in q_hits}
+        d_stems = {stem_token(t) for t in d_hits}
+        if len(q_stems) >= min_distinct_stems and len(d_stems) >= min_distinct_stems:
+            shared[concept_id] = (list(q_hits), list(d_hits))
+    return shared
+
+
+def compute_rag_signature(custom_synonyms: dict[str, list[str]] | None = None) -> str:
+    """Compute a deterministic hash signature across version, stopwords, clusters, and custom synonyms."""
+    clusters, _ = build_concept_lookup(custom_synonyms)
+    norm_custom: list[tuple[str, list[str]]] = []
+    if isinstance(custom_synonyms, dict):
+        for k, vals in sorted(custom_synonyms.items(), key=lambda kv: str(kv[0]).lower()):
+            if isinstance(vals, (list, tuple, set)):
+                norm_custom.append(
+                    (
+                        str(k).lower().strip(),
+                        sorted(str(v).lower().strip() for v in vals if str(v).strip()),
+                    )
+                )
+    payload = {
+        "version": VECTOR_CACHE_VERSION,
+        "stopwords": sorted(STOPWORDS),
+        "clusters": {cid: sorted(set(terms)) for cid, terms in sorted(clusters.items())},
+        "custom_synonyms": norm_custom,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{VECTOR_CACHE_VERSION}:{digest}"
 
 
 def expand_with_concepts(
@@ -324,7 +391,7 @@ def _hash_add(vec: list[float], feature: str, weight: float, dim: int = VECTOR_D
     vec[idx] += sign * weight
 
 
-def _char_fourgrams(tokens: Sequence[str], max_tokens: int = 64) -> list[str]:
+def _char_fourgrams(tokens: Sequence[str], max_tokens: int = 256) -> list[str]:
     grams: dict[str, None] = {}
     for tok in tokens[:max_tokens]:
         padded = f"^{tok}$"
@@ -333,7 +400,7 @@ def _char_fourgrams(tokens: Sequence[str], max_tokens: int = 64) -> list[str]:
             continue
         for i in range(len(padded) - 3):
             grams[padded[i : i + 4]] = None
-    return list(grams.keys())
+    return sorted(grams.keys())
 
 
 def _l2_normalize(vec: list[float]) -> list[float]:
@@ -344,32 +411,37 @@ def _l2_normalize(vec: list[float]) -> list[float]:
 
 
 def _compute_stdlib_vector(
-    text_str: str,
+    tokens: Sequence[str],
     custom_synonyms: dict[str, list[str]] | None = None,
     dim: int = VECTOR_DIM,
 ) -> list[float]:
-    tokens = tokenize_domain(text_str)
     if not tokens:
         return [0.0] * dim
 
-    _, concept_ids = expand_with_concepts(tokens, custom_synonyms)
-    ngrams = _char_fourgrams(tokens)
+    # Sort deduplicated tokens so PYTHONHASHSEED and set iteration order never affect vector output.
+    unique_tokens = sorted(dict.fromkeys(tokens))
+    vec_tokens = unique_tokens[:512]
+    concept_hits = group_tokens_by_concept(vec_tokens, custom_synonyms)
+    qualified_concepts = sorted(
+        cid for cid, hits in concept_hits.items() if len({stem_token(t) for t in hits}) >= 2
+    )
+    ngrams = _char_fourgrams(vec_tokens, max_tokens=256)
 
     vec = [0.0] * dim
 
-    # 1. Domain tokens (weight 1.0, group-normalized for length invariance)
-    tok_scale = 1.0 / math.sqrt(len(tokens))
-    for tok in tokens:
+    # 1. Domain tokens + stems (weight 1.0 / 0.5, group-normalized for length invariance)
+    tok_scale = 1.0 / math.sqrt(len(vec_tokens))
+    for tok in vec_tokens:
         _hash_add(vec, f"tok:{tok}", 1.0 * tok_scale, dim)
-        stem = _stem_token(tok)
+        stem = stem_token(tok)
         if stem != tok:
             _hash_add(vec, f"tok:{stem}", 0.5 * tok_scale, dim)
 
-    # 2. Canonical concept IDs (weight 2.5x, multi-hash projected to prevent collision washout)
-    if concept_ids:
+    # 2. Qualified canonical concept IDs (weight 1.6x, 4-projection hash)
+    if qualified_concepts:
         projections = 4
-        concept_scale = 2.5 / math.sqrt(len(concept_ids) * projections)
-        for cid in concept_ids:
+        concept_scale = 1.6 / math.sqrt(len(qualified_concepts) * projections)
+        for cid in qualified_concepts:
             for p in range(projections):
                 _hash_add(vec, f"{cid}#{p}", concept_scale, dim)
 
@@ -379,7 +451,7 @@ def _compute_stdlib_vector(
         for g in ngrams:
             _hash_add(vec, f"g4:{g}", gram_scale, dim)
 
-    return _l2_normalize(vec)
+    return [round(v, 6) for v in _l2_normalize(vec)]
 
 
 def compute_semantic_vector(
@@ -390,17 +462,17 @@ def compute_semantic_vector(
     """Compute a 256-dim L2-normalized semantic vector.
 
     Tier 1: Uses `fastembed` (`BAAI/bge-small-en-v1.5`) ONLY if `V1_USE_FASTEMBED=1` and installed.
-    Tier 2: Fast deterministic stdlib 256-dim feature-hashed L2 vector combining domain tokens (1.0x),
-            canonical concept IDs (2.5x), and character 4-grams (0.5x).
+    Tier 2: Fast deterministic stdlib 256-dim crc32 feature-hashed L2 vector combining domain tokens
+            (1.0x), stems (0.5x), >=2-stem qualified concept IDs (1.6x), and character 4-grams (0.5x).
     """
     global _FASTEMBED_MODEL, _FASTEMBED_FAILED
 
     if isinstance(text, str):
-        text_str = text
+        tokens = tokenize_domain(text)
     else:
-        text_str = " ".join(str(x) for x in text)
+        tokens = [str(x).lower().strip() for x in text if str(x).strip()]
 
-    stdlib_vec = _compute_stdlib_vector(text_str, custom_synonyms=custom_synonyms, dim=dim)
+    stdlib_vec = _compute_stdlib_vector(tokens, custom_synonyms=custom_synonyms, dim=dim)
 
     if os.environ.get("V1_USE_FASTEMBED") == "1" and not _FASTEMBED_FAILED:
         try:
@@ -408,7 +480,8 @@ def compute_semantic_vector(
                 from fastembed import TextEmbedding  # type: ignore
 
                 _FASTEMBED_MODEL = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-            emb_list = list(_FASTEMBED_MODEL.embed([text_str[:4000]]))
+            embed_text = text if isinstance(text, str) else " ".join(sorted(dict.fromkeys(tokens)))
+            emb_list = list(_FASTEMBED_MODEL.embed([embed_text[:4000]]))
             if emb_list:
                 raw = [float(x) for x in emb_list[0]]
                 folded = [0.0] * dim
@@ -416,7 +489,7 @@ def compute_semantic_vector(
                     folded[idx % dim] += val
                 dense_norm = _l2_normalize(folded)
                 blended = [0.65 * dense_norm[i] + 0.35 * stdlib_vec[i] for i in range(dim)]
-                return _l2_normalize(blended)
+                return [round(v, 6) for v in _l2_normalize(blended)]
         except Exception:
             _FASTEMBED_FAILED = True
 

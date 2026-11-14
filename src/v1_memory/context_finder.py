@@ -5,13 +5,23 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
+import tempfile
+import time
 from pathlib import Path
 
+from v1_memory.hybrid_rag import build_concept_lookup, group_tokens_by_concept
 from v1_memory.index_store import default_state_home, find_context_matches, rebuild_portable_index
-from v1_memory.providers import parse_generic_jsonl
-from v1_memory.text_utils import clean_snippet, clean_user_prompt, tokenize_domain
+from v1_memory.providers import _flatten_content
+from v1_memory.text_utils import (
+    clean_snippet,
+    clean_user_prompt,
+    ensure_utf8_stdio,
+    stem_token,
+    tokenize_domain,
+)
 
 DEFAULT_CONFIG = {
     "enabled": True,
@@ -37,23 +47,82 @@ def load_config(state_home: Path | None = None) -> dict:
     ]:
         if cand.exists():
             try:
-                cfg.update(json.loads(cand.read_text(encoding="utf-8")))
-                break
+                loaded = json.loads(cand.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    cfg.update(loaded)
+                    break
             except Exception:
                 pass
     return cfg
 
 
 def extract_call_word(prompt: str, call_words: list[str]) -> tuple[bool, str]:
-    lowered = prompt.lower()
+    """Match configured call words on strict token boundaries and strip them from prompt."""
     triggered = False
-    cleaned = prompt
-    for cw in call_words:
-        if cw.lower() in lowered:
+    cleaned = prompt or ""
+    for cw in call_words or []:
+        cw_clean = str(cw).strip()
+        if not cw_clean:
+            continue
+        pattern = rf"(?<![a-z0-9_]){re.escape(cw_clean)}(?![a-z0-9_-])"
+        if re.search(pattern, cleaned, flags=re.IGNORECASE):
             triggered = True
-            cleaned = re.sub(re.escape(cw), " ", cleaned, flags=re.IGNORECASE)
-            lowered = cleaned.lower()
-    return triggered, cleaned.strip()
+            cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return triggered, cleaned
+
+
+def _extract_recent_user_prompts_from_transcript(
+    tpath: Path,
+    max_prompts: int = 3,
+    tail_bytes: int = 131072,
+) -> list[str]:
+    """Read at most the last `tail_bytes` of a JSONL transcript to extract recent user prompts."""
+    prompts: list[str] = []
+    try:
+        if not tpath.exists() or not tpath.is_file():
+            return prompts
+        size = tpath.stat().st_size
+        with open(tpath, "rb") as f:
+            if size > tail_bytes:
+                f.seek(max(0, size - tail_bytes))
+            raw_chunk = f.read(tail_bytes).decode("utf-8", errors="replace")
+        for line in raw_chunk.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+
+            stype = obj.get("type", "")
+            src = obj.get("source", "")
+            content = _flatten_content(obj.get("content", ""))
+            if stype == "USER_INPUT" and src == "USER_EXPLICIT" and content:
+                prompts.append(content)
+                continue
+            if stype == "user" and isinstance(obj.get("message"), dict):
+                txt = _flatten_content(obj["message"].get("content", ""))
+                if txt:
+                    prompts.append(txt)
+                continue
+            payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else obj
+            if stype == "event_msg" and isinstance(payload, dict) and payload.get("type") == "user_message":
+                txt = str(payload.get("message") or "").strip()
+                if txt:
+                    prompts.append(txt)
+                continue
+            role = str((payload.get("role") if isinstance(payload, dict) else None) or obj.get("role") or "").lower()
+            if role in ("user", "human") and isinstance(payload, dict):
+                txt = _flatten_content(payload.get("content") or payload.get("text") or "")
+                if txt:
+                    prompts.append(txt)
+    except Exception:
+        pass
+    return prompts[-max_prompts:]
 
 
 def load_seen_state(seen_path: Path, conv_id: str) -> dict:
@@ -70,6 +139,8 @@ def load_seen_state(seen_path: Path, conv_id: str) -> dict:
         return default
     try:
         data = json.loads(seen_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return default
         entry = data.get(conv_id, {})
         if isinstance(entry, list):
             return {
@@ -81,11 +152,13 @@ def load_seen_state(seen_path: Path, conv_id: str) -> dict:
                 "pending_prompts": [],
                 "prev_window_tokens": [],
             }
+        if not isinstance(entry, dict):
+            return default
         return {
-            "ids": set(entry.get("ids", [])),
+            "ids": set(entry.get("ids", [])) if isinstance(entry.get("ids"), list) else set(),
             "last_prompt_hash": str(entry.get("last_prompt_hash", "")),
             "start_checked": bool(entry.get("start_checked", False)),
-            "prompt_count": int(entry.get("prompt_count", 0)),
+            "prompt_count": int(entry.get("prompt_count", 0) or 0),
             "recent_prompts": [p for p in entry.get("recent_prompts", []) if isinstance(p, str)][-5:],
             "pending_prompts": [p for p in entry.get("pending_prompts", []) if isinstance(p, str)][-10:],
             "prev_window_tokens": [t for t in entry.get("prev_window_tokens", []) if isinstance(t, str)][-120:],
@@ -105,15 +178,32 @@ def save_seen_state(
     pending_prompts: list[str],
     prev_window_tokens: list[str],
 ) -> None:
+    seen_path.parent.mkdir(parents=True, exist_ok=True)
     data: dict = {}
     if seen_path.exists():
-        try:
-            data = json.loads(seen_path.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
+        for attempt in range(3):
+            try:
+                raw_text = seen_path.read_text(encoding="utf-8")
+                if raw_text.strip():
+                    loaded = json.loads(raw_text)
+                    if isinstance(loaded, dict):
+                        data = loaded
+                break
+            except Exception:
+                if attempt < 2:
+                    time.sleep(0.01)
+
     entry = data.get(conv_id, {})
-    existing = set(entry if isinstance(entry, list) else entry.get("ids", []))
-    prev_checked = False if isinstance(entry, list) else bool(entry.get("start_checked", False))
+    if isinstance(entry, list):
+        existing = set(entry)
+        prev_checked = False
+    elif isinstance(entry, dict):
+        existing = set(entry.get("ids", [])) if isinstance(entry.get("ids"), list) else set()
+        prev_checked = bool(entry.get("start_checked", False))
+    else:
+        existing = set()
+        prev_checked = False
+
     existing.update(new_ids)
     if conv_id in data:
         del data[conv_id]
@@ -129,45 +219,107 @@ def save_seen_state(
     if len(data) > 50:
         for old_k in list(data.keys())[:-50]:
             del data[old_k]
-    seen_path.parent.mkdir(parents=True, exist_ok=True)
-    seen_path.write_text(json.dumps(data), encoding="utf-8")
+
+    payload_str = json.dumps(data)
+    tmp_name: str | None = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(seen_path.parent),
+            prefix="context_seen_",
+            suffix=".tmp",
+            delete=False,
+        )
+        tmp_name = tmp.name
+        try:
+            tmp.write(payload_str)
+            tmp.flush()
+        finally:
+            tmp.close()
+
+        for attempt in range(3):
+            try:
+                os.replace(tmp_name, seen_path)
+                tmp_name = None
+                break
+            except PermissionError:
+                if attempt < 2:
+                    time.sleep(0.01)
+                else:
+                    raise
+    except Exception:
+        pass
+    finally:
+        if tmp_name and os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
 
 
 def detect_batch_pivot(
     pending_prompts: list[str],
     prev_window_tokens: list[str],
     min_matched_tokens: int,
+    custom_synonyms: dict[str, list[str]] | None = None,
 ) -> tuple[bool, str, list[str]]:
     """Inspect ONLY the new tumbling batch of prompts against the prior baseline window."""
-    batch_text = " ".join(p for p in pending_prompts if p.strip()).strip()
-    batch_tokens = tokenize_domain(batch_text)
+    prompt_token_lists = [tokenize_domain(p) for p in pending_prompts if isinstance(p, str) and p.strip()]
+    prompt_token_lists = [toks for toks in prompt_token_lists if toks]
+
+    seen_bt: dict[str, None] = {}
+    for toks in prompt_token_lists:
+        for t in toks:
+            seen_bt[t] = None
+    batch_tokens = list(seen_bt.keys())
     next_baseline = batch_tokens[-120:] if batch_tokens else list(prev_window_tokens[-120:])
     if len(batch_tokens) < min_matched_tokens:
         return False, "", next_baseline
 
     prev_set = set(prev_window_tokens)
     if not prev_set:
-        return True, batch_text, next_baseline
+        return True, " ".join(batch_tokens), next_baseline
 
-    batch_set = set(batch_tokens)
-    overlap_ratio = len(batch_set & prev_set) / len(batch_set)
-    novel_tokens = [t for t in batch_tokens if t not in prev_set]
-    if (overlap_ratio < 0.35 and len(novel_tokens) >= min_matched_tokens) or len(novel_tokens) >= 4:
-        query = " ".join(novel_tokens) if len(novel_tokens) >= min_matched_tokens else batch_text
-        return True, query, next_baseline
+    prev_stems = {stem_token(t) for t in prev_set}
+    prev_c_hits = group_tokens_by_concept(prev_set, custom_synonyms)
+    prev_concepts = {
+        cid for cid, hits in prev_c_hits.items() if len({stem_token(t) for t in hits}) >= 2
+    }
+    _, term_to_concepts = build_concept_lookup(custom_synonyms)
 
-    # Isolate a late shift (e.g., Turn 3 pivot + short Turn 4-5 follow-ups) inside the 5-prompt batch
-    for split_idx in range(1, len(pending_prompts)):
-        tail_text = " ".join(pending_prompts[split_idx:]).strip()
-        tail_tokens = tokenize_domain(tail_text)
-        if len(tail_tokens) < min_matched_tokens:
+    def _is_aligned(tok: str, extra_stems: set[str], extra_concepts: set[str]) -> bool:
+        st = stem_token(tok)
+        if tok in prev_set or st in prev_stems or st in extra_stems:
+            return True
+        t_cids = term_to_concepts.get(tok, set()) | term_to_concepts.get(st, set())
+        active_concepts = prev_concepts | extra_concepts
+        return any(f"concept:{c}" in active_concepts for c in t_cids)
+
+    # 1. Isolate a mid-batch shift (e.g., Turn 2 continues Turn 1 topic, then Turn 3-5 pivots to a new topic)
+    for split_idx in range(1, len(prompt_token_lists)):
+        head_tokens = list(dict.fromkeys(t for toks in prompt_token_lists[:split_idx] for t in toks))
+        tail_tokens = list(dict.fromkeys(t for toks in prompt_token_lists[split_idx:] for t in toks))
+        if len(tail_tokens) < min_matched_tokens or not head_tokens:
             continue
-        head_set = set(tokenize_domain(" ".join(pending_prompts[:split_idx]))) | prev_set
-        tail_set = set(tail_tokens)
-        tail_novel = [t for t in tail_tokens if t not in head_set]
-        tail_overlap = len(tail_set & head_set) / len(tail_set)
-        if tail_overlap < 0.30 and len(tail_novel) >= min_matched_tokens:
-            return True, " ".join(tail_novel), next_baseline
+        head_aligned = sum(1 for t in head_tokens if _is_aligned(t, set(), set()))
+        if (head_aligned / len(head_tokens)) >= 0.25:
+            head_stems = {stem_token(t) for t in head_tokens}
+            head_c_hits = group_tokens_by_concept(head_tokens, custom_synonyms)
+            head_concepts = {
+                cid for cid, hits in head_c_hits.items() if len({stem_token(t) for t in hits}) >= 2
+            }
+            tail_aligned = sum(1 for t in tail_tokens if _is_aligned(t, head_stems, head_concepts))
+            tail_novel = [t for t in tail_tokens if not _is_aligned(t, head_stems, head_concepts)]
+            if (tail_aligned / len(tail_tokens)) < 0.30 and len(tail_novel) >= min_matched_tokens:
+                return True, " ".join(tail_novel), tail_novel[-120:]
+
+    # 2. Whole-batch pivot check
+    aligned_count = sum(1 for t in batch_tokens if _is_aligned(t, set(), set()))
+    overlap_ratio = aligned_count / len(batch_tokens)
+    novel_tokens = [t for t in batch_tokens if not _is_aligned(t, set(), set())]
+    if overlap_ratio < 0.35 and len(novel_tokens) >= min_matched_tokens:
+        return True, " ".join(novel_tokens), novel_tokens[-120:]
 
     return False, "", next_baseline
 
@@ -195,6 +347,8 @@ def format_match_banner(matches: list[dict], trigger_reason: str, threshold_pct:
 def detect_hook_format(payload: dict, requested: str) -> str:
     if requested != "auto":
         return requested
+    if not isinstance(payload, dict):
+        return "generic"
     if "hookEventName" in payload and payload.get("hookEventName") == "PreInvocation":
         return "antigravity"
     if payload.get("hook_event_name") == "UserPromptSubmit" or ("prompt" in payload and "session_id" in payload):
@@ -236,8 +390,16 @@ def run_hook_payload(
     agy_db_path: Path | None = None,
     index_db_path: Path | None = None,
 ) -> tuple[str, str | None, list[dict]]:
+    if not isinstance(payload, dict):
+        return ("generic" if fmt == "auto" else fmt), None, []
+
     detected_fmt = detect_hook_format(payload, fmt)
-    if int(payload.get("invocationNum", 1)) != 1:
+    raw_inv = payload.get("invocationNum", 1)
+    try:
+        inv_num = 1 if raw_inv is None else int(raw_inv)
+    except (ValueError, TypeError):
+        inv_num = 1
+    if inv_num != 1:
         return detected_fmt, None, []
 
     raw_input = payload.get("lastUserInput") or payload.get("prompt") or ""
@@ -250,9 +412,16 @@ def run_hook_payload(
     if not cfg.get("enabled", True):
         return detected_fmt, None, []
 
-    conv_id = str(payload.get("conversationId") or payload.get("session_id") or "default-session")
-    initial_steps = int(payload.get("initialNumSteps", 0))
+    conv_id = str(payload.get("conversationId") or payload.get("session_id") or "default-session").strip() or "default-session"
+    raw_steps = payload.get("initialNumSteps", 0)
+    try:
+        initial_steps = 0 if raw_steps is None else int(raw_steps)
+    except (ValueError, TypeError):
+        initial_steps = 0
+
     call_words = cfg.get("call_words", DEFAULT_CONFIG["call_words"])
+    if not isinstance(call_words, list):
+        call_words = list(DEFAULT_CONFIG["call_words"])
     called_explicitly, prompt = extract_call_word(prompt_raw, call_words)
 
     seen_path = resolved_state / "context_finder_seen.json"
@@ -281,9 +450,24 @@ def run_hook_payload(
     is_start_of_convo = (not state["start_checked"]) and (initial_steps <= allowed_start_steps)
     is_nth_prompt = (auto_pivot_n > 0) and (new_prompt_count % auto_pivot_n == 0)
 
-    if len(prompt_raw) < 12 and not called_explicitly:
+    # Only skip short prompts when they are not call-word triggers, not Nth-prompt batch checks,
+    # and have fewer than `min_matched` domain tokens (so 2-token prompts like "stm32 uart" still run).
+    if (
+        len(prompt_raw) < 12
+        and len(curr_tokens) < min_matched
+        and not called_explicitly
+        and not is_nth_prompt
+    ):
         save_seen_state(
-            seen_path, conv_id, [], prompt_hash, False, new_prompt_count, updated_recent, updated_pending, state["prev_window_tokens"]
+            seen_path,
+            conv_id,
+            [],
+            prompt_hash,
+            False,
+            new_prompt_count,
+            updated_recent,
+            updated_pending,
+            state["prev_window_tokens"],
         )
         return detected_fmt, None, []
 
@@ -297,12 +481,12 @@ def run_hook_payload(
     if called_explicitly:
         trigger_reason = "Call word triggered"
         exclude_ids = set()
+        lock_start = True
         if len(curr_tokens) < min_matched:
             candidates: list[str] = []
-            tpath = str(payload.get("transcriptPath") or payload.get("transcript_path") or "").strip()
-            if tpath and Path(tpath).exists():
-                rec = parse_generic_jsonl(Path(tpath), provider="transcript")
-                for ut in rec.user_turns[-3:]:
+            tpath_str = str(payload.get("transcriptPath") or payload.get("transcript_path") or "").strip()
+            if tpath_str:
+                for ut in _extract_recent_user_prompts_from_transcript(Path(tpath_str), max_prompts=3, tail_bytes=131072):
                     _, stripped = extract_call_word(ut, call_words)
                     if stripped:
                         candidates.append(stripped)
@@ -311,9 +495,18 @@ def run_hook_payload(
                 if stripped:
                     candidates.append(stripped)
             fallback_text = " ".join(dict.fromkeys(candidates)).strip()
-            if len(tokenize_domain(fallback_text)) < min_matched:
+            fb_tokens = tokenize_domain(fallback_text)
+            if len(fb_tokens) < min_matched:
                 save_seen_state(
-                    seen_path, conv_id, [], prompt_hash, False, new_prompt_count, updated_recent, updated_pending, new_baseline
+                    seen_path,
+                    conv_id,
+                    [],
+                    prompt_hash,
+                    True,
+                    new_prompt_count,
+                    updated_recent,
+                    updated_pending,
+                    new_baseline,
                 )
                 return (
                     detected_fmt,
@@ -323,12 +516,25 @@ def run_hook_payload(
                     [],
                 )
             search_query = fallback_text
+            if not new_baseline:
+                new_baseline = fb_tokens[-120:]
             trigger_reason = "Call word triggered (recent context)"
+        else:
+            if not new_baseline:
+                new_baseline = curr_tokens[-120:]
     elif is_start_of_convo:
         if len(curr_tokens) < min_matched:
             # Keep start_checked False so a turn-1 greeting ("hi there") defers to turn 2.
             save_seen_state(
-                seen_path, conv_id, [], prompt_hash, False, new_prompt_count, updated_recent, updated_pending, new_baseline
+                seen_path,
+                conv_id,
+                [],
+                prompt_hash,
+                False,
+                new_prompt_count,
+                updated_recent,
+                updated_pending,
+                new_baseline,
             )
             return detected_fmt, None, []
         trigger_reason = "New conversation start"
@@ -336,7 +542,12 @@ def run_hook_payload(
         new_baseline = curr_tokens[-120:]
         reset_pending = True
     elif is_nth_prompt:
-        is_pivot, pivot_query, rotated_baseline = detect_batch_pivot(updated_pending, state["prev_window_tokens"], min_matched)
+        is_pivot, pivot_query, rotated_baseline = detect_batch_pivot(
+            updated_pending,
+            state["prev_window_tokens"],
+            min_matched,
+            custom_synonyms=custom_synonyms,
+        )
         new_baseline = rotated_baseline
         reset_pending = True
         if not is_pivot:
@@ -393,12 +604,13 @@ def run_hook_payload(
 
 
 def main() -> int:
+    ensure_utf8_stdio()
     parser = argparse.ArgumentParser(description="Multi-LLM proactive conversation context matcher.")
     parser.add_argument("--test", metavar="PROMPT", help="Evaluate a prompt without writing hook state")
     parser.add_argument("--pivot", metavar="TOPIC", help="Check a mid-conversation topic pivot cleanly")
     parser.add_argument("--prompt", metavar="PROMPT", help="Direct non-hook prompt check (returns JSON)")
     parser.add_argument("--conv", default="", help="Current conversation/session ID to exclude")
-    parser.add_argument("--threshold", type=float, default=40.0, help="Match percentage threshold (default: 40.0)")
+    parser.add_argument("--threshold", type=float, default=None, help="Match percentage threshold (default: from config or 40.0)")
     parser.add_argument("--provider", default="all", help="all, antigravity, claude, codex, generic")
     parser.add_argument("--format", default="auto", choices=["auto", "antigravity", "claude", "generic", "plain"])
     parser.add_argument("--reindex", action="store_true", help="Refresh ~/.v1-memory/index.db for non-Antigravity transcripts")
@@ -413,10 +625,13 @@ def main() -> int:
 
     query_text = args.pivot or args.test or args.prompt
     if query_text is not None:
+        eff_threshold = float(args.threshold) if args.threshold is not None else float(cfg.get("threshold_pct", 40.0))
         tokens, matches = find_context_matches(
             query_text,
             current_conv_id=args.conv,
-            threshold_pct=args.threshold,
+            threshold_pct=eff_threshold,
+            min_matched_tokens=int(cfg.get("min_matched_tokens", 2)),
+            max_matches=int(cfg.get("max_matches", 3)),
             provider_filter=args.provider,
             state_home=state_home,
             hybrid_rag=bool(cfg.get("hybrid_rag", True)),
@@ -426,7 +641,11 @@ def main() -> int:
         print(json.dumps({"query_tokens": tokens, "matches": matches}, indent=2))
         return 0
 
-    raw = sys.stdin.read()
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        print("{}")
+        return 0
     if not raw.strip():
         print("{}")
         return 0
@@ -436,8 +655,11 @@ def main() -> int:
         print("{}")
         return 0
 
-    fmt, msg, _ = run_hook_payload(payload, fmt=args.format, provider_filter=args.provider, state_home=state_home)
-    emit_hook_output(msg, fmt)
+    try:
+        fmt, msg, _ = run_hook_payload(payload, fmt=args.format, provider_filter=args.provider, state_home=state_home)
+        emit_hook_output(msg, fmt)
+    except Exception:
+        print("{}")
     return 0
 
 

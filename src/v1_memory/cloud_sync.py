@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from v1_memory.index_store import default_state_home, rebuild_portable_index
+from v1_memory.text_utils import ensure_utf8_stdio
 
 DEFAULT_REMOTE = os.environ.get("V1_GDRIVE_REMOTE", os.environ.get("AGY_GDRIVE_REMOTE", "gdrive:AI-Agent-Memory"))
 EXCLUDE_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "cache"}
@@ -33,7 +34,8 @@ def load_sync_config(state_home: Path) -> dict:
     cfg = state_home / "cloud_sync_config.json"
     if cfg.exists():
         try:
-            return json.loads(cfg.read_text(encoding="utf-8"))
+            loaded = json.loads(cfg.read_text(encoding="utf-8"))
+            return loaded if isinstance(loaded, dict) else {}
         except Exception:
             return {}
     return {}
@@ -88,7 +90,8 @@ def sqlite_safe_snapshot(src_db: Path, dst_db: Path) -> None:
     dst_db.parent.mkdir(parents=True, exist_ok=True)
     if dst_db.exists():
         dst_db.unlink()
-    src_conn = sqlite3.connect(f"file:{src_db}?mode=ro", uri=True, timeout=15.0)
+    uri = f"{Path(src_db).resolve().as_uri()}?mode=ro"
+    src_conn = sqlite3.connect(uri, uri=True, timeout=15.0)
     try:
         dst_conn = sqlite3.connect(str(dst_db))
         try:
@@ -165,9 +168,12 @@ def folder_copy_update(src: Path, dst: Path, exclude_names: set[str] | None = No
         dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
         rel = Path(dirpath).relative_to(src)
         for fname in filenames:
-            if fname in ex or fname in EXCLUDE_RUNTIME_FILES or fname.endswith((".db-wal", ".db-shm", ".tmp")):
+            if fname in EXCLUDE_RUNTIME_FILES or fname.endswith((".db-wal", ".db-shm", ".tmp")):
                 continue
             sfile = Path(dirpath) / fname
+            rel_posix = sfile.relative_to(src).as_posix()
+            if rel_posix in ex or fname in ex:
+                continue
             dfile = dst / rel / fname
             try:
                 sst = sfile.stat()
@@ -187,7 +193,12 @@ def folder_copy_update(src: Path, dst: Path, exclude_names: set[str] | None = No
 
 
 def stage_wal_snapshots(sources: dict[str, Path], stage_root: Path) -> tuple[set[str], int]:
-    """Snapshot every active SQLite DB cleanly into stage_root matching remote subpaths."""
+    """Snapshot every active SQLite DB cleanly into stage_root matching remote subpaths.
+
+    Returns `(snapshotted_rel_paths, wal_count)` where each entry in `snapshotted_rel_paths`
+    is the POSIX path `<remote_sub>/<relative_db_path>` so duplicate `.db`/`.db-wal` hits
+    and same-basename files in different folders never collide.
+    """
     snapshotted_rel_paths: set[str] = set()
     wal_count = 0
     for remote_sub, root in sources.items():
@@ -196,7 +207,6 @@ def stage_wal_snapshots(sources: dict[str, Path], stage_root: Path) -> tuple[set
             for fname in filenames:
                 if fname.endswith((".db", ".sqlite")) or fname.endswith((".db-wal", ".sqlite-wal")):
                     if fname.endswith("-wal"):
-                        wal_count += 1
                         base_name = fname[:-4]
                         src_db = Path(dirpath) / base_name
                     else:
@@ -205,11 +215,24 @@ def stage_wal_snapshots(sources: dict[str, Path], stage_root: Path) -> tuple[set
                             continue
                     if src_db.exists():
                         rel = src_db.relative_to(root)
+                        rel_key = f"{remote_sub}/{rel.as_posix()}"
                         dst_db = stage_root / remote_sub / rel
-                        if str(dst_db) not in snapshotted_rel_paths:
+                        if rel_key not in snapshotted_rel_paths:
                             sqlite_safe_snapshot(src_db, dst_db)
-                            snapshotted_rel_paths.add(src_db.name)
+                            snapshotted_rel_paths.add(rel_key)
+                            wal_count += 1
     return snapshotted_rel_paths, wal_count
+
+
+def _excludes_for_provider(remote_sub: str, snap_rel_paths: set[str]) -> set[str]:
+    prefix = f"{remote_sub}/"
+    out: set[str] = set()
+    for p in snap_rel_paths:
+        if p.startswith(prefix) and len(p) > len(prefix):
+            out.add(p[len(prefix) :])
+        elif "/" not in p:
+            out.add(p)
+    return out
 
 
 def run_sync(
@@ -238,8 +261,9 @@ def run_sync(
     if state_file.exists():
         try:
             saved = json.loads(state_file.read_text(encoding="utf-8"))
-            old_fp = saved.get("files", {})
-            last_sync_iso = saved.get("last_sync_utc")
+            if isinstance(saved, dict):
+                old_fp = saved.get("files", {}) if isinstance(saved.get("files"), dict) else {}
+                last_sync_iso = saved.get("last_sync_utc")
         except Exception:
             old_fp = {}
 
@@ -261,7 +285,7 @@ def run_sync(
 
     with tempfile.TemporaryDirectory(prefix="v1_sync_") as tmpdir_str:
         stage = Path(tmpdir_str)
-        snap_names, wal_count = stage_wal_snapshots(sources, stage)
+        snap_rel_paths, wal_count = stage_wal_snapshots(sources, stage)
         manifest = {
             "hostname": hostname,
             "platform": sys.platform,
@@ -278,7 +302,8 @@ def run_sync(
         if drive_folder is not None:
             copied = 0
             for remote_sub, local_root in sources.items():
-                copied += folder_copy_update(local_root, drive_folder / remote_sub, exclude_names=snap_names, dry_run=dry_run)
+                prov_ex = _excludes_for_provider(remote_sub, snap_rel_paths)
+                copied += folder_copy_update(local_root, drive_folder / remote_sub, exclude_names=prov_ex, dry_run=dry_run)
             copied += folder_copy_update(stage, drive_folder, dry_run=dry_run)
             if not dry_run:
                 state_file.write_text(
@@ -310,8 +335,12 @@ def run_sync(
             }
 
         for remote_sub, local_root in sources.items():
+            prov_ex = _excludes_for_provider(remote_sub, snap_rel_paths)
             cmd = [rclone_exe, "copy", str(local_root), f"{remote}/{remote_sub}", "--update", "--stats=0", "--log-level=ERROR"]
-            for ex in ["*.db-wal", "*.db-shm", "*.tmp"] + sorted(snap_names):
+            rclone_excludes = ["*.db-wal", "*.db-shm", "*.tmp"] + sorted(
+                f"/{ex}" if "/" in ex else ex for ex in prov_ex
+            )
+            for ex in rclone_excludes:
                 cmd.extend(["--exclude", ex])
             if dry_run:
                 cmd.append("--dry-run")
@@ -361,7 +390,14 @@ def get_sync_status(
     sources = discover_sync_sources(user_home, resolved_state, providers, extra_dirs)
     fp = collect_fingerprint(sources)
     state_file = resolved_state / "cloud_sync_state.json"
-    saved = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
+    saved: dict = {}
+    if state_file.exists():
+        try:
+            loaded = json.loads(state_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                saved = loaded
+        except Exception:
+            saved = {}
     added, modified, removed = diff_fingerprints(saved.get("files", {}), fp)
     drive_folder = detect_drive_folder(resolved_state, target_dir)
     rclone_exe = find_rclone()
@@ -380,6 +416,7 @@ def get_sync_status(
 
 
 def main_sync() -> int:
+    ensure_utf8_stdio()
     parser = argparse.ArgumentParser(description="Incremental non-destructive backup for AI CLI conversations and skills.")
     parser.add_argument("--target-dir", help="Mounted Drive folder (e.g. G:\\My Drive\\AI-Agent-Memory)")
     parser.add_argument("--remote", default=DEFAULT_REMOTE, help=f"rclone remote (default: {DEFAULT_REMOTE})")
@@ -404,6 +441,7 @@ def main_sync() -> int:
 
 
 def main_status() -> int:
+    ensure_utf8_stdio()
     parser = argparse.ArgumentParser(description="Check AI Agent Cloud Memory backup status.")
     parser.add_argument("--target-dir")
     parser.add_argument("--remote", default=DEFAULT_REMOTE)

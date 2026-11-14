@@ -8,8 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from v1_memory.cloud_sync import get_sync_status, run_sync
+from v1_memory.context_finder import load_config
 from v1_memory.index_store import default_state_home, find_context_matches, rebuild_portable_index
 from v1_memory.recall import load_conversation_turns
+from v1_memory.text_utils import ensure_utf8_stdio
 
 TOOLS = [
     {
@@ -67,9 +69,12 @@ TOOLS = [
 
 
 def handle_rpc(req: dict[str, Any], home: Path | None = None, state_home: Path | None = None) -> dict[str, Any] | None:
+    if not isinstance(req, dict):
+        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
+
     method = req.get("method")
     req_id = req.get("id")
-    params = req.get("params") or {}
+    params = req.get("params") if isinstance(req.get("params"), dict) else {}
     resolved = default_state_home(state_home)
 
     if method == "initialize":
@@ -88,36 +93,110 @@ def handle_rpc(req: dict[str, Any], home: Path | None = None, state_home: Path |
         return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
     if method == "tools/call":
         name = params.get("name")
-        args = params.get("arguments") or {}
-        if name == "find_context":
-            tokens, matches = find_context_matches(
-                args.get("query", ""),
-                current_conv_id=args.get("current_conversation_id", ""),
-                threshold_pct=float(args.get("threshold_pct", 40.0)),
-                provider_filter=args.get("provider", "all"),
-                home=home,
-                state_home=resolved,
-            )
-            payload = {"query_tokens": tokens, "matches": matches}
-        elif name == "recall_conversation":
-            loaded = load_conversation_turns(args["conversation_id"], int(args.get("max_turns", 20)), home=home, state_home=resolved)
-            if not loaded:
-                payload = {"error": f"Conversation not found: {args['conversation_id']}"}
-            else:
-                title, turns = loaded
-                payload = {
-                    "conversation_id": args["conversation_id"],
-                    "title": title,
-                    "turns": [{"role": r, "timestamp": ts, "content": txt} for r, ts, txt in turns],
-                }
-        elif name == "backup_status":
-            payload = get_sync_status(state_home=resolved)
-        elif name == "sync_backup":
-            payload = run_sync(dry_run=bool(args.get("dry_run", False)), force=bool(args.get("force", False)), state_home=resolved)
-        elif name == "reindex_providers":
-            payload = {"indexed_conversations": rebuild_portable_index(resolved / "index.db")}
+        raw_args = params.get("arguments")
+        if raw_args is None:
+            args: dict[str, Any] = {}
+        elif isinstance(raw_args, dict):
+            args = raw_args
         else:
-            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown tool: {name}"}}
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32602, "message": "Invalid params: 'arguments' must be an object"},
+            }
+
+        cfg = load_config(resolved)
+        syns = cfg.get("synonyms") if isinstance(cfg.get("synonyms"), dict) else None
+
+        try:
+            if name == "find_context":
+                if "query" not in args or not isinstance(args.get("query"), str):
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32602, "message": "Invalid params: missing required string 'query'"},
+                    }
+                eff_threshold = (
+                    float(args["threshold_pct"])
+                    if args.get("threshold_pct") is not None
+                    else float(cfg.get("threshold_pct", 40.0))
+                )
+                eff_min_matched = (
+                    int(args["min_matched_tokens"])
+                    if args.get("min_matched_tokens") is not None
+                    else int(cfg.get("min_matched_tokens", 2))
+                )
+                eff_max_matches = (
+                    int(args["max_matches"])
+                    if args.get("max_matches") is not None
+                    else int(cfg.get("max_matches", 3))
+                )
+                eff_hybrid = (
+                    bool(args["hybrid_rag"])
+                    if args.get("hybrid_rag") is not None
+                    else bool(cfg.get("hybrid_rag", True))
+                )
+                eff_sem_weight = (
+                    float(args["semantic_weight"])
+                    if args.get("semantic_weight") is not None
+                    else float(cfg.get("semantic_weight", 0.45))
+                )
+                tokens, matches = find_context_matches(
+                    args["query"],
+                    current_conv_id=str(args.get("current_conversation_id") or ""),
+                    threshold_pct=eff_threshold,
+                    min_matched_tokens=eff_min_matched,
+                    max_matches=eff_max_matches,
+                    provider_filter=str(args.get("provider") or "all"),
+                    home=home,
+                    state_home=resolved,
+                    hybrid_rag=eff_hybrid,
+                    semantic_weight=eff_sem_weight,
+                    custom_synonyms=syns,
+                )
+                payload: dict[str, Any] = {"query_tokens": tokens, "matches": matches}
+            elif name == "recall_conversation":
+                conv_id = args.get("conversation_id")
+                if not isinstance(conv_id, str) or not conv_id.strip():
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32602, "message": "Invalid params: missing required 'conversation_id'"},
+                    }
+                max_turns = int(args["max_turns"]) if args.get("max_turns") is not None else 20
+                loaded = load_conversation_turns(conv_id, max_turns=max_turns, home=home, state_home=resolved)
+                if not loaded:
+                    payload = {"error": f"Conversation not found: {conv_id}"}
+                else:
+                    title, turns = loaded
+                    payload = {
+                        "conversation_id": conv_id,
+                        "title": title,
+                        "turns": [{"role": r, "timestamp": ts, "content": txt} for r, ts, txt in turns],
+                    }
+            elif name == "backup_status":
+                payload = get_sync_status(home=home, state_home=resolved)
+            elif name == "sync_backup":
+                payload = run_sync(
+                    dry_run=bool(args.get("dry_run", False)),
+                    force=bool(args.get("force", False)),
+                    home=home,
+                    state_home=resolved,
+                )
+            elif name == "reindex_providers":
+                payload = {
+                    "indexed_conversations": rebuild_portable_index(
+                        resolved / "index.db",
+                        home=home,
+                        custom_synonyms=syns,
+                    )
+                }
+            else:
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown tool: {name}"}}
+        except (KeyError, TypeError, ValueError) as exc:
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Invalid params: {exc}"}}
+        except Exception as exc:
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": f"Tool execution error: {exc}"}}
 
         return {
             "jsonrpc": "2.0",
@@ -131,6 +210,7 @@ def handle_rpc(req: dict[str, Any], home: Path | None = None, state_home: Path |
 
 
 def main() -> int:
+    ensure_utf8_stdio()
     for line in sys.stdin:
         line = line.strip()
         if not line:
