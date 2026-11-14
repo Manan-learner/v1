@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -16,13 +17,16 @@ from v1_memory.hybrid_rag import (
     compute_semantic_vector,
     cosine_similarity,
     expand_with_concepts,
+    group_tokens_by_concept,
     reciprocal_rank_fusion,
-    token_concept_map,
 )
 from v1_memory.providers import iter_provider_conversations
 from v1_memory.text_utils import build_summary_line, clean_snippet, tokenize_domain
 
 DEFAULT_STATE_HOME = Path.home() / ".v1-memory"
+VECTOR_CACHE_VERSION = "2.1"
+HIGH_DF_SUPPRESSION_RATIO = 0.55
+MIN_CORPUS_FOR_IDF = 5
 
 LAST_REBUILD_STATS: dict[str, int] = {"total": 0, "updated": 0, "skipped": 0}
 LAST_UNINDEXED_CACHE_STATS: dict[str, int] = {"hits": 0, "misses": 0}
@@ -114,10 +118,14 @@ def ensure_portable_schema(conn: sqlite3.Connection) -> None:
             workspace TEXT NOT NULL,
             summary TEXT NOT NULL,
             combined_text TEXT NOT NULL,
-            vector_json TEXT NOT NULL
+            vector_json TEXT NOT NULL,
+            cache_version TEXT NOT NULL DEFAULT ''
         )
         """
     )
+    unindexed_cols = {row[1] for row in conn.execute("PRAGMA table_info(antigravity_unindexed_cache)").fetchall()}
+    if "cache_version" not in unindexed_cols:
+        conn.execute("ALTER TABLE antigravity_unindexed_cache ADD COLUMN cache_version TEXT NOT NULL DEFAULT ''")
     conn.commit()
 
 
@@ -159,7 +167,7 @@ def rebuild_portable_index(
                 prev is not None
                 and prev["last_modified_time"] == rec.last_modified_time
                 and int(prev["step_count"]) == int(rec.step_count)
-                and prev["content_hash"]
+                and str(prev["content_hash"]).startswith("v21_")
                 and prev["vector_json"]
                 and prev["vector_json"] != "[]"
                 and rec.conversation_id in fts_cids
@@ -173,7 +181,7 @@ def rebuild_portable_index(
             last_a = rec.agent_turns[-1] if rec.agent_turns else ""
             summary = build_summary_line(first_u, last_a, rec.title)
             combined_payload = f"{rec.title}\n{user_joined}\n{agent_joined}"
-            content_hash = hashlib.sha1(combined_payload.encode("utf-8", errors="ignore")).hexdigest()[:16]
+            content_hash = "v21_" + hashlib.sha1(combined_payload.encode("utf-8", errors="ignore")).hexdigest()[:12]
             vec = compute_semantic_vector(combined_payload, custom_synonyms=custom_synonyms)
             vector_json = json.dumps([round(v, 6) for v in vec])
 
@@ -272,9 +280,12 @@ def _load_unindexed_cache(index_db: Path | None) -> dict[str, dict]:
         }
         if "antigravity_unindexed_cache" not in tables:
             return {}
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(antigravity_unindexed_cache)").fetchall()}
+        if "cache_version" not in cols:
+            return {}
         rows = conn.execute(
             """
-            SELECT conversation_id, last_modified_time, step_count, title, workspace, summary, combined_text, vector_json
+            SELECT conversation_id, last_modified_time, step_count, title, workspace, summary, combined_text, vector_json, cache_version
             FROM antigravity_unindexed_cache
             """
         ).fetchall()
@@ -299,8 +310,8 @@ def _save_unindexed_cache_rows(index_db: Path | None, rows: list[tuple]) -> None
                 """
                 INSERT OR REPLACE INTO antigravity_unindexed_cache (
                     conversation_id, last_modified_time, step_count,
-                    title, workspace, summary, combined_text, vector_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    title, workspace, summary, combined_text, vector_json, cache_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -318,13 +329,14 @@ def _collect_antigravity_candidates(
     exclude_ids: set[str],
     index_db: Path | None = None,
     custom_synonyms: dict[str, list[str]] | None = None,
-) -> dict[str, dict]:
+) -> tuple[dict[str, dict], int]:
     global LAST_UNINDEXED_CACHE_STATS
     docs: dict[str, dict] = {}
     if not agy_db.exists():
-        return docs
+        return docs, 0
 
     conn, tmp_path = open_readonly_snapshot(agy_db)
+    total_count = 0
     try:
         conn.row_factory = sqlite3.Row
         ranked_chunks = conn.execute(
@@ -363,8 +375,19 @@ def _collect_antigravity_candidates(
             """,
             (current_conv_id,),
         ).fetchall()
+
+        cnt_row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM conversation_summaries
+            WHERE conversation_id != ?
+              AND COALESCE(parent_conversation_id, '') = ''
+            """,
+            (current_conv_id,),
+        ).fetchone()
+        total_count = int(cnt_row[0]) if cnt_row else 0
     except sqlite3.OperationalError:
-        return docs
+        return docs, 0
     finally:
         conn.close()
         if tmp_path and os.path.exists(tmp_path):
@@ -403,7 +426,12 @@ def _collect_antigravity_candidates(
         mtime = (r["last_modified_time"] or "")[:19]
         step_count = int(r["step_count"] or 0)
         cached = cached_unindexed.get(cid)
-        if cached and cached.get("last_modified_time") == mtime and int(cached.get("step_count", -1)) == step_count:
+        if (
+            cached
+            and cached.get("cache_version") == VECTOR_CACHE_VERSION
+            and cached.get("last_modified_time") == mtime
+            and int(cached.get("step_count", -1)) == step_count
+        ):
             cache_hits += 1
             docs[cid] = {
                 "conversation_id": cid,
@@ -450,12 +478,14 @@ def _collect_antigravity_candidates(
             "parts": clean_parts,
             "vector_json": vec_json,
         }
-        new_cache_rows.append((cid, mtime, step_count, display_title, workspace_str, summary, combined_text, vec_json))
+        new_cache_rows.append(
+            (cid, mtime, step_count, display_title, workspace_str, summary, combined_text, vec_json, VECTOR_CACHE_VERSION)
+        )
 
     if new_cache_rows:
         _save_unindexed_cache_rows(index_db, new_cache_rows)
     LAST_UNINDEXED_CACHE_STATS = {"hits": cache_hits, "misses": cache_misses}
-    return docs
+    return docs, total_count
 
 
 def _collect_portable_candidates(
@@ -465,22 +495,32 @@ def _collect_portable_candidates(
     exclude_ids: set[str],
     provider_filter: str | None = None,
     include_dense_scan: bool = True,
-) -> dict[str, dict]:
+) -> tuple[dict[str, dict], int]:
     docs: dict[str, dict] = {}
     if not index_db.exists():
-        return docs
+        return docs, 0
 
     conn, tmp_path = open_readonly_snapshot(index_db)
+    total_count = 0
     try:
         conn.row_factory = sqlite3.Row
         cols = {row[1] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()}
         vec_expr = "c.vector_json" if "vector_json" in cols else "'[]' AS vector_json"
 
-        where = ["conversations_fts MATCH ?", "c.conversation_id != ?"]
-        params: list = [fts_query, current_conv_id]
+        base_where = ["c.conversation_id != ?"]
+        base_params: list = [current_conv_id]
         if provider_filter and provider_filter not in ("auto", "all"):
-            where.append("c.provider = ?")
-            params.append(provider_filter)
+            base_where.append("c.provider = ?")
+            base_params.append(provider_filter)
+
+        cnt_row = conn.execute(
+            f"SELECT COUNT(*) FROM conversations c WHERE {' AND '.join(base_where)}",
+            base_params,
+        ).fetchone()
+        total_count = int(cnt_row[0]) if cnt_row else 0
+
+        where = ["conversations_fts MATCH ?"] + base_where
+        params: list = [fts_query] + base_params
 
         rows = conn.execute(
             f"""
@@ -507,11 +547,6 @@ def _collect_portable_candidates(
 
         dense_rows = []
         if include_dense_scan:
-            d_where = ["c.conversation_id != ?"]
-            d_params: list = [current_conv_id]
-            if provider_filter and provider_filter not in ("auto", "all"):
-                d_where.append("c.provider = ?")
-                d_params.append(provider_filter)
             dense_rows = conn.execute(
                 f"""
                 SELECT
@@ -526,14 +561,14 @@ def _collect_portable_candidates(
                     c.agent_text,
                     {vec_expr}
                 FROM conversations c
-                WHERE {' AND '.join(d_where)}
+                WHERE {' AND '.join(base_where)}
                 ORDER BY c.last_modified_time DESC
                 LIMIT 150
                 """,
-                d_params,
+                base_params,
             ).fetchall()
     except sqlite3.OperationalError:
-        return docs
+        return docs, 0
     finally:
         conn.close()
         if tmp_path and os.path.exists(tmp_path):
@@ -572,7 +607,7 @@ def _collect_portable_candidates(
             "vector_json": r["vector_json"] or "[]",
             "fts_rank": 999,
         }
-    return docs
+    return docs, total_count
 
 
 def _load_configured_synonyms(state_home: Path) -> dict[str, list[str]]:
@@ -589,6 +624,34 @@ def _load_configured_synonyms(state_home: Path) -> dict[str, list[str]]:
             except Exception:
                 pass
     return {}
+
+
+def _compute_corpus_stats(
+    doc_tokens_by_cid: dict[str, set[str]],
+    total_db_parent_count: int,
+    high_df_ratio: float = HIGH_DF_SUPPRESSION_RATIO,
+    min_corpus_size: int = MIN_CORPUS_FOR_IDF,
+) -> tuple[int, dict[str, int], set[str]]:
+    """Compute corpus document count, per-token document frequencies, and high-DF suppress list."""
+    n_corpus = max(len(doc_tokens_by_cid), total_db_parent_count)
+    df: dict[str, int] = {}
+    for d_toks in doc_tokens_by_cid.values():
+        for tok in d_toks:
+            df[tok] = df.get(tok, 0) + 1
+    if n_corpus < min_corpus_size:
+        return n_corpus, df, set()
+    high_df = {tok for tok, count in df.items() if (count / n_corpus) >= high_df_ratio}
+    return n_corpus, df, high_df
+
+
+def _bm25_idf(tok: str, n_corpus: int, df: dict[str, int], high_df_tokens: set[str]) -> float:
+    """Compute BM25-style IDF weight with N < 5 small-corpus guard and df=0 clamping."""
+    if n_corpus < MIN_CORPUS_FOR_IDF:
+        return 1.0
+    if tok in high_df_tokens:
+        return 0.0
+    df_eff = max(1, df.get(tok, 0))
+    return math.log(1.0 + (n_corpus - df_eff + 0.5) / (df_eff + 0.5))
 
 
 def find_context_matches(
@@ -620,9 +683,9 @@ def find_context_matches(
 
     syns = custom_synonyms if custom_synonyms is not None else _load_configured_synonyms(resolved_state)
     if hybrid_rag:
-        expanded_q_tokens, q_concepts = expand_with_concepts(q_tokens, syns)
+        expanded_q_tokens, _ = expand_with_concepts(q_tokens, syns)
     else:
-        expanded_q_tokens, q_concepts = list(q_tokens), []
+        expanded_q_tokens = list(q_tokens)
 
     fts_terms = []
     for t in expanded_q_tokens[:60]:
@@ -635,118 +698,132 @@ def find_context_matches(
     fts_query = " OR ".join(dict.fromkeys(fts_terms))
 
     docs_by_id: dict[str, dict] = {}
+    total_db_parent_count = 0
     if provider_filter in ("all", "auto", "antigravity"):
-        docs_by_id.update(
-            _collect_antigravity_candidates(
-                agy_db,
-                fts_query,
-                current_conv_id,
-                ex,
-                index_db=port_db,
-                custom_synonyms=syns,
-            )
+        agy_docs, agy_count = _collect_antigravity_candidates(
+            agy_db,
+            fts_query,
+            current_conv_id,
+            ex,
+            index_db=port_db,
+            custom_synonyms=syns,
         )
+        docs_by_id.update(agy_docs)
+        total_db_parent_count += agy_count
     if provider_filter != "antigravity":
-        docs_by_id.update(
-            _collect_portable_candidates(
-                port_db,
-                fts_query,
-                current_conv_id,
-                ex,
-                provider_filter=provider_filter,
-                include_dense_scan=hybrid_rag,
-            )
+        port_docs, port_count = _collect_portable_candidates(
+            port_db,
+            fts_query,
+            current_conv_id,
+            ex,
+            provider_filter=provider_filter,
+            include_dense_scan=hybrid_rag,
         )
+        docs_by_id.update(port_docs)
+        total_db_parent_count += port_count
 
     if not docs_by_id:
         return q_tokens, []
 
-    q_set = set(q_tokens)
-    q_concept_set = set(q_concepts)
-    q_tok_concepts = token_concept_map(q_tokens, syns) if hybrid_rag else {}
-    q_vec = compute_semantic_vector(prompt_text, custom_synonyms=syns) if hybrid_rag else []
-
-    candidate_evals: dict[str, dict] = {}
-    sparse_rank_tuples: list[tuple[tuple, str]] = []
-    dense_rank_tuples: list[tuple[tuple, str]] = []
-
+    combined_by_cid: dict[str, str] = {}
+    title_tokens_by_cid: dict[str, set[str]] = {}
+    doc_tokens_by_cid: dict[str, set[str]] = {}
     for cid, info in docs_by_id.items():
         combined = " ".join(p for p in info["parts"] if p)[:120000]
         title_tokens = set(tokenize_domain(info["title"]))
         doc_tokens = set(tokenize_domain(combined)) | title_tokens
         if not doc_tokens:
             continue
+        combined_by_cid[cid] = combined
+        title_tokens_by_cid[cid] = title_tokens
+        doc_tokens_by_cid[cid] = doc_tokens
 
-        exact_matched = sorted(q_set & doc_tokens)
-        denom = min(len(q_set), len(doc_tokens))
-        exact_pct = round((len(exact_matched) / denom) * 100.0, 1) if denom else 0.0
-        title_hits = len(q_set & title_tokens)
+    if not doc_tokens_by_cid:
+        return q_tokens, []
 
-        if not hybrid_rag:
-            if len(exact_matched) < min_matched_tokens or exact_pct < threshold_pct:
-                continue
-            candidate_evals[cid] = {
-                "info": info,
-                "hybrid_pct": exact_pct,
-                "exact_pct": exact_pct,
-                "semantic_score": 0.0,
-                "matched_tokens": exact_matched,
-                "title_hits": title_hits,
-                "retrieval_mode": "sparse",
-            }
-            sparse_rank_tuples.append(((exact_pct, title_hits, len(exact_matched), info["last_modified_time"]), cid))
+    n_corpus, df, high_df_tokens = _compute_corpus_stats(doc_tokens_by_cid, total_db_parent_count)
+    q_active = [t for t in q_tokens if t not in high_df_tokens]
+    q_active_set = set(q_active)
+    if len(q_active_set) < min_matched_tokens:
+        return q_tokens, []
+
+    q_idf_sum = sum(_bm25_idf(t, n_corpus, df, high_df_tokens) for t in q_active_set)
+    q_concept_hits = group_tokens_by_concept(q_active, syns) if hybrid_rag else {}
+    if hybrid_rag:
+        q_vec_input = q_active if (high_df_tokens & set(q_tokens)) else prompt_text
+        q_vec = compute_semantic_vector(q_vec_input, custom_synonyms=syns)
+    else:
+        q_vec = []
+
+    w_sem = max(0.0, min(1.0, float(semantic_weight)))
+    w_con = 1.0 - w_sem
+
+    candidate_evals: dict[str, dict] = {}
+    sparse_rank_tuples: list[tuple[tuple, str]] = []
+    dense_rank_tuples: list[tuple[tuple, str]] = []
+
+    for cid, doc_tokens in doc_tokens_by_cid.items():
+        info = docs_by_id[cid]
+        doc_active = doc_tokens - high_df_tokens
+        if not doc_active:
             continue
 
-        # Parse cached vector or compute on the fly
-        doc_vec: list[float] = []
-        raw_vjson = info.get("vector_json") or "[]"
-        if raw_vjson and raw_vjson != "[]":
-            try:
-                parsed_v = json.loads(raw_vjson)
-                if isinstance(parsed_v, list) and parsed_v:
-                    doc_vec = [float(x) for x in parsed_v]
-            except Exception:
-                doc_vec = []
-        if not doc_vec:
-            doc_vec = compute_semantic_vector(combined, custom_synonyms=syns)
+        exact_matched = sorted(q_active_set & doc_active)
+        title_hits = len(q_active_set & (title_tokens_by_cid[cid] - high_df_tokens))
+        doc_idf_sum = sum(_bm25_idf(t, n_corpus, df, high_df_tokens) for t in doc_active)
+        denom_weight = min(q_idf_sum, doc_idf_sum)
+        exact_weight = sum(_bm25_idf(t, n_corpus, df, high_df_tokens) for t in exact_matched)
+        exact_pct = round(min(100.0, (exact_weight / denom_weight) * 100.0), 1) if denom_weight > 1e-9 else 0.0
 
-        cos_sim = max(0.0, cosine_similarity(q_vec, doc_vec))
-        _, doc_concepts = expand_with_concepts(doc_tokens, syns)
-        shared_concepts = sorted(q_concept_set & set(doc_concepts))
-        doc_tok_concepts = token_concept_map(doc_tokens, syns)
+        cos_sim = 0.0
+        qualifying_concepts: list[str] = []
+        covered_q_tokens = set(exact_matched)
+        concept_doc_hits: list[str] = []
 
-        concept_q_matched = [
-            t for t in q_tokens if bool(q_tok_concepts.get(t, set()) & set(shared_concepts))
-        ]
-        concept_doc_hits = sorted(
-            t for t in doc_tokens if t not in q_set and bool(doc_tok_concepts.get(t, set()) & set(shared_concepts))
-        )
-        effective_q_matched = sorted(set(exact_matched) | set(concept_q_matched))
-        effective_doc_count = len(exact_matched) + len(concept_doc_hits)
+        if hybrid_rag:
+            doc_vec: list[float] = []
+            raw_vjson = info.get("vector_json") or "[]"
+            if raw_vjson and raw_vjson != "[]":
+                try:
+                    parsed_v = json.loads(raw_vjson)
+                    if isinstance(parsed_v, list) and parsed_v:
+                        doc_vec = [float(x) for x in parsed_v]
+                except Exception:
+                    doc_vec = []
+            if not doc_vec:
+                doc_vec_input = sorted(doc_active) if (high_df_tokens & doc_tokens) else combined_by_cid[cid]
+                doc_vec = compute_semantic_vector(doc_vec_input, custom_synonyms=syns)
 
-        has_exact_gate = len(exact_matched) >= min_matched_tokens
-        has_concept_gate = (
-            bool(shared_concepts)
-            and len(effective_q_matched) >= min_matched_tokens
-            and effective_doc_count >= min_matched_tokens
-        )
-        has_dense_gate = cos_sim >= 0.55 and len(exact_matched) >= 1
+            cos_sim = max(0.0, cosine_similarity(q_vec, doc_vec))
+            doc_concept_hits = group_tokens_by_concept(doc_active, syns)
+            doc_hit_pool: set[str] = set()
+            for concept_id, q_c_hits in q_concept_hits.items():
+                d_c_hits = doc_concept_hits.get(concept_id, [])
+                if len(q_c_hits) >= 2 and len(d_c_hits) >= 2:
+                    qualifying_concepts.append(concept_id)
+                    covered_q_tokens.update(q_c_hits)
+                    doc_hit_pool.update(t for t in d_c_hits if t not in q_active_set)
+            concept_doc_hits = sorted(doc_hit_pool)
 
-        if not (has_exact_gate or has_concept_gate or has_dense_gate):
+        if len(covered_q_tokens) < min_matched_tokens:
             continue
 
-        concept_cov = len(effective_q_matched) / max(1, len(q_set))
-        w_sem = max(0.0, min(1.0, float(semantic_weight)))
-        w_con = 1.0 - w_sem
-        concept_and_cosine_pct = round(min(100.0, (w_con * concept_cov + w_sem * cos_sim) * 100.0), 1)
-        hybrid_pct = round(max(exact_pct, concept_and_cosine_pct), 1)
+        covered_weight = sum(_bm25_idf(t, n_corpus, df, high_df_tokens) for t in covered_q_tokens)
+        concept_coverage_pct = round(min(100.0, (covered_weight / denom_weight) * 100.0), 1) if denom_weight > 1e-9 else 0.0
+
+        if hybrid_rag and qualifying_concepts:
+            concept_and_cosine_pct = round(min(100.0, w_con * concept_coverage_pct + w_sem * (cos_sim * 100.0)), 1)
+            hybrid_pct = round(max(exact_pct, concept_and_cosine_pct), 1)
+        else:
+            concept_and_cosine_pct = 0.0
+            hybrid_pct = exact_pct
 
         if hybrid_pct < threshold_pct:
             continue
 
         matched_out = list(exact_matched)
-        if shared_concepts and (len(exact_matched) < len(q_set) or concept_and_cosine_pct >= exact_pct):
-            for sc in shared_concepts:
+        if qualifying_concepts and (len(exact_matched) < len(q_active_set) or concept_and_cosine_pct >= exact_pct):
+            for sc in qualifying_concepts:
                 if sc not in matched_out:
                     matched_out.append(sc)
             for dh in concept_doc_hits[:5]:
@@ -760,14 +837,15 @@ def find_context_matches(
             "semantic_score": round(cos_sim, 4),
             "matched_tokens": matched_out,
             "title_hits": title_hits,
-            "retrieval_mode": "hybrid_rrf",
+            "retrieval_mode": "hybrid_rrf" if hybrid_rag else "sparse",
         }
         sparse_rank_tuples.append(
             ((exact_pct, len(exact_matched), len(concept_doc_hits), title_hits, info["last_modified_time"]), cid)
         )
-        dense_rank_tuples.append(
-            ((cos_sim, len(shared_concepts), concept_and_cosine_pct, info["last_modified_time"]), cid)
-        )
+        if hybrid_rag:
+            dense_rank_tuples.append(
+                ((cos_sim, len(qualifying_concepts), concept_coverage_pct, info["last_modified_time"]), cid)
+            )
 
     if not candidate_evals:
         return q_tokens, []

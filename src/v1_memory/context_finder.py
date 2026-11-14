@@ -141,19 +141,20 @@ def detect_batch_pivot(
     """Inspect ONLY the new tumbling batch of prompts against the prior baseline window."""
     batch_text = " ".join(p for p in pending_prompts if p.strip()).strip()
     batch_tokens = tokenize_domain(batch_text)
+    next_baseline = batch_tokens[-120:] if batch_tokens else list(prev_window_tokens[-120:])
     if len(batch_tokens) < min_matched_tokens:
-        return False, "", batch_tokens[-120:]
+        return False, "", next_baseline
 
     prev_set = set(prev_window_tokens)
     if not prev_set:
-        return True, batch_text, batch_tokens[-120:]
+        return True, batch_text, next_baseline
 
     batch_set = set(batch_tokens)
     overlap_ratio = len(batch_set & prev_set) / len(batch_set)
     novel_tokens = [t for t in batch_tokens if t not in prev_set]
     if (overlap_ratio < 0.35 and len(novel_tokens) >= min_matched_tokens) or len(novel_tokens) >= 4:
         query = " ".join(novel_tokens) if len(novel_tokens) >= min_matched_tokens else batch_text
-        return True, query, batch_tokens[-120:]
+        return True, query, next_baseline
 
     # Isolate a late shift (e.g., Turn 3 pivot + short Turn 4-5 follow-ups) inside the 5-prompt batch
     for split_idx in range(1, len(pending_prompts)):
@@ -166,9 +167,9 @@ def detect_batch_pivot(
         tail_novel = [t for t in tail_tokens if t not in head_set]
         tail_overlap = len(tail_set & head_set) / len(tail_set)
         if tail_overlap < 0.30 and len(tail_novel) >= min_matched_tokens:
-            return True, " ".join(tail_novel), batch_tokens[-120:]
+            return True, " ".join(tail_novel), next_baseline
 
-    return False, "", batch_tokens[-120:]
+    return False, "", next_baseline
 
 
 def format_match_banner(matches: list[dict], trigger_reason: str, threshold_pct: float) -> str:

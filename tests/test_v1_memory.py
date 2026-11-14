@@ -357,6 +357,205 @@ class V1MemoryTests(unittest.TestCase):
         self.assertEqual(m_second[0]["conversation_id"], unindexed_cid)
         self.assertEqual(get_last_unindexed_cache_stats(), {"hits": 1, "misses": 0})
 
+    def test_boilerplate_and_conversational_false_positives_rejected(self) -> None:
+        # 1. Tokenization drops diagnostic/meta words, contraction fragments, dotted abbrevs, and <=2-digit bare numbers
+        self.assertEqual(tokenize_domain("where is the rag located can i see a demonstration"), ["rag"])
+        self.assertEqual(tokenize_domain("problems expected located concerns verification implementation"), [])
+        self.assertEqual(tokenize_domain("don't won't didn't isn't e.g. i.e. step 10 and 12 table index"), [])
+        self.assertEqual(tokenize_domain("STM32 915MHz LoRa"), ["stm32", "915mhz", "915", "mhz", "lora"])
+
+        # 2. Conversational / meta queries return 0 false positives against technical & database chats
+        extra_dir = self.root / "extra_logs"
+        extra_dir.mkdir(parents=True, exist_ok=True)
+        (extra_dir / "db-notes.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "role": "user",
+                            "content": "Review database migration table indexing vector status and expected problems",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "role": "assistant",
+                            "content": "Completed schema migration table verification with zero problems located.",
+                        }
+                    ),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        rebuild_portable_index(
+            self.state_home / "index.db",
+            providers=["claude", "codex", "generic"],
+            home=self.home,
+            custom_dirs=[extra_dir],
+        )
+
+        for noisy_prompt in (
+            "where is the rag located can i see a demonstration",
+            "problems expected located concerns",
+            "problems expected located concerns verification implementation",
+        ):
+            _, matches = find_context_matches(noisy_prompt, home=self.home, state_home=self.state_home)
+            self.assertEqual(matches, [], f"Unexpected false positive for prompt: {noisy_prompt!r}")
+
+        # Single-token rag + unrelated token must NOT hijack database_storage or single-hit rag_search
+        _, single_rag_matches = find_context_matches(
+            "rag completely_unrelated_anchor",
+            home=self.home,
+            state_home=self.state_home,
+        )
+        self.assertEqual(single_rag_matches, [])
+
+        # 5-prompt tumbling hook batch of conversational/meta prompts stays completely silent
+        cid = "conv-noisy-batch"
+        noisy_turns = [
+            "don't know if verification works",
+            "problems expected located concerns",
+            "can you verify implementation status and summary",
+            "note exact details e.g. missing results",
+            "where is the rag located can i see a demonstration",
+        ]
+        for step_idx, prompt in enumerate(noisy_turns, start=1):
+            _, msg, hook_matches = run_hook_payload(
+                {"conversationId": cid, "initialNumSteps": step_idx * 2, "lastUserInput": prompt},
+                home=self.home,
+                state_home=self.state_home,
+            )
+            self.assertIsNone(msg)
+            self.assertEqual(hook_matches, [])
+
+    def test_corpus_high_df_suppression_and_idf_weighting_with_real_queries(self) -> None:
+        # Build an 8-conversation corpus:
+        # - workspace_common_header / daily_sync_marker appear in 5/8 docs (62.5% >= 55% -> suppressed)
+        # - mid_df_alpha / mid_df_beta appear in 3/8 docs (37.5% < 55% -> lower IDF weight)
+        # - rare_anchor_one / rare_anchor_two appear in 1/8 docs (12.5% -> high IDF weight)
+        corpus_dir = self.root / "corpus_hdf"
+        corpus_dir.mkdir(parents=True, exist_ok=True)
+        for idx in range(1, 5):
+            mid_terms = "mid_df_alpha mid_df_beta" if idx <= 3 else ""
+            (corpus_dir / f"filler-{idx:02d}.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"workspace_common_header daily_sync_marker {mid_terms} "
+                                    f"session_{idx} topic_a_{idx} topic_b_{idx} topic_c_{idx}"
+                                ),
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "role": "assistant",
+                                "content": "Processed standard workspace_common_header daily_sync_marker check.",
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+        (corpus_dir / "rag-notes-05.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "role": "user",
+                            "content": "workspace_common_header daily_sync_marker tune semantic embeddings vector bm25",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "role": "assistant",
+                            "content": "Evaluated hybrid_rag cosine similarity and rrf fusion.",
+                        }
+                    ),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (corpus_dir / "rare-anchor-06.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "role": "user",
+                            "content": "Investigate rare_anchor_one and rare_anchor_two calibration drift",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "role": "assistant",
+                            "content": "Verified rare_anchor_one rare_anchor_two registers.",
+                        }
+                    ),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        # Plus the 2 existing fixtures in self.home (radio-link-01 and fdcan-boot-02) => N = 8 total docs
+        total_indexed = rebuild_portable_index(
+            self.state_home / "index.db",
+            providers=["claude", "codex", "generic"],
+            home=self.home,
+            custom_dirs=[corpus_dir],
+        )
+        self.assertEqual(total_indexed, 8)
+
+        # High-DF tokens (>= 55% DF) are dynamically suppressed -> 0 matches
+        _, hdf_only = find_context_matches(
+            "workspace_common_header daily_sync_marker",
+            home=self.home,
+            state_home=self.state_home,
+        )
+        self.assertEqual(hdf_only, [])
+
+        # 2 high-DF tokens + 1 rare token leaves < 2 active tokens -> 0 matches
+        _, hdf_plus_one = find_context_matches(
+            "workspace_common_header daily_sync_marker sx1262",
+            home=self.home,
+            state_home=self.state_home,
+        )
+        self.assertEqual(hdf_plus_one, [])
+
+        # BM25-IDF downweights 3/8 mid-DF pairs (< 40%) while matching 1/8 rare anchor pairs (> 40%)
+        _, idf_matches = find_context_matches(
+            "mid_df_alpha mid_df_beta rare_anchor_one rare_anchor_two",
+            home=self.home,
+            state_home=self.state_home,
+        )
+        self.assertEqual(len(idf_matches), 1)
+        self.assertEqual(idf_matches[0]["conversation_id"], "generic:rare-anchor-06")
+        self.assertGreaterEqual(idf_matches[0]["match_pct"], 60.0)
+
+        # Real exact query (STM32H7 FDCAN) and zero-overlap synonym query still match cleanly >= 40%
+        _, fdcan_matches = find_context_matches("STM32H7 FDCAN", home=self.home, state_home=self.state_home)
+        self.assertTrue(fdcan_matches)
+        self.assertEqual(fdcan_matches[0]["conversation_id"], "codex:fdcan-boot-02")
+        self.assertGreaterEqual(fdcan_matches[0]["match_pct"], 40.0)
+
+        _, rf_syn_matches = find_context_matches(
+            "wireless radio rssi link dropouts",
+            home=self.home,
+            state_home=self.state_home,
+        )
+        self.assertTrue(rf_syn_matches)
+        self.assertEqual(rf_syn_matches[0]["conversation_id"], "claude:radio-link-01")
+        self.assertGreaterEqual(rf_syn_matches[0]["match_pct"], 40.0)
+
+        # Genuine multi-term RAG query matches rag-notes-05 via rag_search concept cluster
+        _, rag_matches = find_context_matches(
+            "hybrid_rag rrf cosine",
+            home=self.home,
+            state_home=self.state_home,
+        )
+        self.assertTrue(rag_matches)
+        self.assertEqual(rag_matches[0]["conversation_id"], "generic:rag-notes-05")
+        self.assertGreaterEqual(rag_matches[0]["match_pct"], 40.0)
+
     def test_zero_personal_paths_or_identifiers_in_repo(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         forbidden = re.compile(

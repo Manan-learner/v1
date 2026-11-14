@@ -101,7 +101,6 @@ DEFAULT_CONCEPT_CLUSTERS: dict[str, list[str]] = {
         "docker",
         "dockerfile",
         "ingress",
-        "service",
         "namespace",
         "kubectl",
         "cluster",
@@ -148,20 +147,24 @@ DEFAULT_CONCEPT_CLUSTERS: dict[str, list[str]] = {
         "schema",
         "migration",
         "migrations",
-        "index",
-        "indexing",
-        "indexed",
-        "query",
-        "table",
-        "tables",
         "postgres",
         "postgresql",
         "bigquery",
+        "spanner",
         "transaction",
         "vacuum",
-        "cursor",
-        "cache",
-        "caching",
+    ],
+    "rag_search": [
+        "rag",
+        "hybrid_rag",
+        "rrf",
+        "bm25",
+        "fts5",
+        "vector",
+        "embedding",
+        "embeddings",
+        "semantic",
+        "cosine",
     ],
     "cloud_backup_sync": [
         "cloud",
@@ -193,6 +196,7 @@ DEFAULT_SYNONYMS = DEFAULT_CONCEPT_CLUSTERS
 
 _FASTEMBED_MODEL = None
 _FASTEMBED_FAILED = False
+_DEFAULT_LOOKUP_CACHE: tuple[dict[str, list[str]], dict[str, set[str]]] | None = None
 
 
 def _stem_token(tok: str) -> str:
@@ -206,30 +210,7 @@ def _stem_token(tok: str) -> str:
     return t
 
 
-def build_concept_lookup(
-    custom_synonyms: dict[str, list[str]] | None = None,
-) -> tuple[dict[str, list[str]], dict[str, set[str]]]:
-    """Merge built-in concept clusters with user-configured custom synonyms."""
-    clusters: dict[str, list[str]] = {k: list(v) for k, v in DEFAULT_CONCEPT_CLUSTERS.items()}
-    if custom_synonyms:
-        for raw_key, raw_vals in custom_synonyms.items():
-            if not raw_key or not isinstance(raw_vals, (list, tuple, set)):
-                continue
-            slug = re.sub(r"[^a-z0-9_]+", "_", str(raw_key).lower()).strip("_")
-            if not slug:
-                continue
-            terms = [str(raw_key).lower().strip()] + [str(v).lower().strip() for v in raw_vals if str(v).strip()]
-            expanded_terms: list[str] = []
-            for term in terms:
-                expanded_terms.append(term)
-                expanded_terms.extend(tokenize_domain(term))
-            deduped = list(dict.fromkeys(t for t in expanded_terms if t))
-            if slug in clusters:
-                clusters[slug] = list(dict.fromkeys(clusters[slug] + deduped))
-            else:
-                # Also check if raw_key matches a term inside an existing cluster; still register its own or merge
-                clusters[slug] = deduped
-
+def _build_term_index(clusters: dict[str, list[str]]) -> dict[str, set[str]]:
     term_to_concepts: dict[str, set[str]] = {}
     for cid, terms in clusters.items():
         for term in terms:
@@ -238,7 +219,61 @@ def build_concept_lookup(
                 continue
             term_to_concepts.setdefault(t_low, set()).add(cid)
             term_to_concepts.setdefault(_stem_token(t_low), set()).add(cid)
-    return clusters, term_to_concepts
+    return term_to_concepts
+
+
+def build_concept_lookup(
+    custom_synonyms: dict[str, list[str]] | None = None,
+) -> tuple[dict[str, list[str]], dict[str, set[str]]]:
+    """Merge built-in concept clusters with user-configured custom synonyms."""
+    global _DEFAULT_LOOKUP_CACHE
+    if _DEFAULT_LOOKUP_CACHE is None:
+        base_clusters = {k: list(v) for k, v in DEFAULT_CONCEPT_CLUSTERS.items()}
+        _DEFAULT_LOOKUP_CACHE = (base_clusters, _build_term_index(base_clusters))
+    if not custom_synonyms:
+        return _DEFAULT_LOOKUP_CACHE
+
+    clusters: dict[str, list[str]] = {k: list(v) for k, v in _DEFAULT_LOOKUP_CACHE[0].items()}
+    for raw_key, raw_vals in custom_synonyms.items():
+        if not raw_key or not isinstance(raw_vals, (list, tuple, set)):
+            continue
+        slug = re.sub(r"[^a-z0-9_]+", "_", str(raw_key).lower()).strip("_")
+        if not slug:
+            continue
+        terms = [str(raw_key).lower().strip()] + [str(v).lower().strip() for v in raw_vals if str(v).strip()]
+        expanded_terms: list[str] = []
+        for term in terms:
+            expanded_terms.append(term)
+            expanded_terms.extend(tokenize_domain(term))
+        deduped = list(dict.fromkeys(t for t in expanded_terms if t))
+        if slug in clusters:
+            clusters[slug] = list(dict.fromkeys(clusters[slug] + deduped))
+        else:
+            clusters[slug] = deduped
+
+    return clusters, _build_term_index(clusters)
+
+
+def group_tokens_by_concept(
+    tokens: Iterable[str],
+    custom_synonyms: dict[str, list[str]] | None = None,
+) -> dict[str, list[str]]:
+    """Group input tokens by canonical `concept:<id>` using built-in + custom concept clusters."""
+    _, term_to_concepts = build_concept_lookup(custom_synonyms)
+    grouped: dict[str, list[str]] = {}
+    seen_per_concept: dict[str, set[str]] = {}
+    for raw in tokens:
+        tok = str(raw).lower().strip()
+        if not tok:
+            continue
+        cids = term_to_concepts.get(tok, set()) | term_to_concepts.get(_stem_token(tok), set())
+        for cid in sorted(cids):
+            key = f"concept:{cid}"
+            seen = seen_per_concept.setdefault(key, set())
+            if tok not in seen:
+                seen.add(tok)
+                grouped.setdefault(key, []).append(tok)
+    return grouped
 
 
 def expand_with_concepts(
@@ -256,23 +291,16 @@ def expand_with_concepts(
     else:
         base_tokens = [str(t).lower().strip() for t in tokens if str(t).strip()]
 
-    clusters, term_to_concepts = build_concept_lookup(custom_synonyms)
-    matched_clusters: list[str] = []
-    seen_clusters: set[str] = set()
-
-    for tok in base_tokens:
-        cids = term_to_concepts.get(tok, set()) | term_to_concepts.get(_stem_token(tok), set())
-        for cid in sorted(cids):
-            if cid not in seen_clusters:
-                seen_clusters.add(cid)
-                matched_clusters.append(cid)
+    clusters, _ = build_concept_lookup(custom_synonyms)
+    concept_hits = group_tokens_by_concept(base_tokens, custom_synonyms)
+    concept_ids = list(concept_hits.keys())
 
     expanded: dict[str, None] = {t: None for t in base_tokens if t}
-    for cid in matched_clusters:
-        for synonym in clusters.get(cid, []):
+    for concept_id in concept_ids:
+        raw_cid = concept_id.split(":", 1)[1]
+        for synonym in clusters.get(raw_cid, []):
             expanded[synonym] = None
 
-    concept_ids = [f"concept:{cid}" for cid in matched_clusters]
     return list(expanded.keys()), concept_ids
 
 
@@ -281,13 +309,11 @@ def token_concept_map(
     custom_synonyms: dict[str, list[str]] | None = None,
 ) -> dict[str, set[str]]:
     """Map each token to its matched canonical `concept:<id>` set."""
-    _, term_to_concepts = build_concept_lookup(custom_synonyms)
+    grouped = group_tokens_by_concept(tokens, custom_synonyms)
     out: dict[str, set[str]] = {}
-    for tok in tokens:
-        t = tok.lower().strip()
-        cids = term_to_concepts.get(t, set()) | term_to_concepts.get(_stem_token(t), set())
-        if cids:
-            out[t] = {f"concept:{c}" for c in cids}
+    for concept_id, matched in grouped.items():
+        for tok in matched:
+            out.setdefault(tok, set()).add(concept_id)
     return out
 
 
