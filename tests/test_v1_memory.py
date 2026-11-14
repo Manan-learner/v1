@@ -111,6 +111,7 @@ class V1MemoryTests(unittest.TestCase):
         self.assertEqual(tokenize_domain("Debug STM32 FDCAN prescaler"), ["stm32", "fdcan", "prescaler"])
         self.assertEqual(tokenize_domain("LoRa 915MHz packets"), ["lora", "915mhz", "915", "mhz", "packets"])
         self.assertEqual(tokenize_domain("can you help me fix a bug in this python script I wrote yesterday"), [])
+        self.assertEqual(tokenize_domain("auto select subagent model prompt orchestrator default docs"), [])
 
     def test_multi_llm_hook_formats_and_permission_rule(self) -> None:
         # Antigravity format
