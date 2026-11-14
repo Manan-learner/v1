@@ -36,7 +36,7 @@ Copy or customize [`examples/context_finder_config.json`](../examples/context_fi
 ```json
 {
   "enabled": true,
-  "threshold_pct": 25.0,
+  "threshold_pct": 40.0,
   "min_matched_tokens": 2,
   "max_matches": 3,
   "start_of_convo_only": true,

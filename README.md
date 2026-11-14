@@ -2,7 +2,7 @@
 
 A lightweight, **zero-dependency** toolkit giving AI coding agents persistent, portable memory across sessions, machines, and LLM harnesses:
 
-1. **Proactive Hybrid-RAG Context Finder & Recall (`v1-context`, `v1-recall`)** — Scans past conversations across **Gemini Antigravity CLI**, **Claude Code**, **OpenAI Codex CLI**, and custom **JSONL/Markdown** logs using a **v2 Hybrid-RAG** pipeline (**Sparse SQLite FTS5 BM25 + 2-tier 256-dim L2 Semantic/Concept Vector + Reciprocal Rank Fusion**) and **Incremental Archive Caching** (`>= 25%` cutoff). Automatically checks new conversation starts and **every 5 prompts** as a tumbling topic-pivot batch, presents the **top 3 summaries**, and requires **explicit user permission** before loading full transcripts.
+1. **Proactive Hybrid-RAG Context Finder & Recall (`v1-context`, `v1-recall`)** — Scans past conversations across **Gemini Antigravity CLI**, **Claude Code**, **OpenAI Codex CLI**, and custom **JSONL/Markdown** logs using a **v2 Hybrid-RAG** pipeline (**Sparse SQLite FTS5 BM25 + 2-tier 256-dim L2 Semantic/Concept Vector + Reciprocal Rank Fusion**) and **Incremental Archive Caching** (`>= 40%` cutoff). Automatically checks new conversation starts and **every 5 prompts** as a tumbling topic-pivot batch, presents the **top 3 summaries**, and requires **explicit user permission** before loading full transcripts.
 2. **Non-Destructive Cloud Memory Backup (`v1-sync`, `v1-status`)** — Incrementally mirrors conversation histories, transcripts, SQLite databases, skills, and hook configs to Google Drive (via a **mounted Google Drive Desktop folder** OR **`rclone`**) using WAL-safe SQLite `.backup()` snapshots.
 3. **Universal MCP Stdio Server (`v1-mcp`)** — Exposes `find_context`, `recall_conversation`, `sync_backup`, `backup_status`, and `reindex_providers` to **any** MCP-compatible client with zero third-party pip packages.
 
@@ -74,7 +74,7 @@ src/v1_memory/
   hybrid_rag.py      # Concept clusters, 2-tier 256-dim L2 semantic vectors, Reciprocal Rank Fusion
   providers.py       # Antigravity, Claude Code, Codex CLI, Markdown/JSONL parsers
   index_store.py     # Incremental FTS5 + vector index & cached unindexed parent scanner
-  context_finder.py  # Multi-format hook engine (25% cutoff, 5-prompt tumbling window)
+  context_finder.py  # Multi-format hook engine (40% cutoff, 5-prompt tumbling window)
   recall.py          # Cross-provider search & transcript turn viewer
   cloud_sync.py      # Non-destructive WAL-safe Drive folder + rclone delta sync
   mcp_server.py      # Zero-dependency MCP stdio JSON-RPC server

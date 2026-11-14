@@ -136,7 +136,7 @@ class V1MemoryTests(unittest.TestCase):
         )
         self.assertEqual(fmt_claude, "claude")
         self.assertEqual(m_claude[0]["provider"], "codex")
-        self.assertIn("25% Detected", msg_claude or "")
+        self.assertIn("40% Detected", msg_claude or "")
 
     def test_tumbling_five_prompt_window_catches_mid_batch_pivot(self) -> None:
         cid = "conv-5-batch"
@@ -230,7 +230,7 @@ class V1MemoryTests(unittest.TestCase):
         )
         self.assertEqual(sparse_matches, [])
 
-        # Hybrid-RAG mode matches the 915MHz SX1262 conversation at >= 25% via concept + semantic vector + RRF
+        # Hybrid-RAG mode matches the 915MHz SX1262 conversation at >= 40% via concept + semantic vector + RRF
         _, hybrid_matches = find_context_matches(
             query,
             home=self.home,
@@ -240,7 +240,7 @@ class V1MemoryTests(unittest.TestCase):
         self.assertTrue(hybrid_matches)
         top = hybrid_matches[0]
         self.assertEqual(top["conversation_id"], "claude:radio-link-01")
-        self.assertGreaterEqual(top["match_pct"], 25.0)
+        self.assertGreaterEqual(top["match_pct"], 40.0)
         self.assertEqual(top["retrieval_mode"], "hybrid_rrf")
         self.assertGreater(top["semantic_score"], 0.25)
         self.assertIn("concept:rf_telemetry", top["matched_tokens"])

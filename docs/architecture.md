@@ -25,7 +25,7 @@ Hybrid-RAG Search + Incremental Cache (~50–200 ms, $0 LLM calls)
    ├─► Incremental Archive Cache:
    │     ├─ conversations table caches content_hash + vector_json (skips unchanged mtime + step_count)
    │     └─ antigravity_unindexed_cache table caches unindexed parent digests + vectors (0 disk re-reads)
-   └─► Reciprocal Rank Fusion (RRF): Fuses sparse + dense ranks & scores hybrid_pct >= 25%
+   └─► Reciprocal Rank Fusion (RRF): Fuses sparse + dense ranks & scores hybrid_pct >= 40%
    │
    ▼
 Top-3 Summary + Permission Gate
@@ -39,18 +39,18 @@ Pure lexical matching fails when a user describes a problem with different termi
 2. **2-Tier 256-Dim L2 Semantic Vectors (`compute_semantic_vector`)**:
    - **Zero-Dependency Default**: Uses deterministic CRC32 feature hashing with signed projections across domain tokens (`1.0x`), multi-hash canonical concept IDs (`2.5x`), and character 4-grams (`0.5x`) for sub-word/part-number resilience (`sx1262` vs `sx1276`, `stm32h7` vs `stm32f4`).
    - **Optional Neural Tier**: If `pip install -e ".[rag]"` (`fastembed>=0.3.0`) is installed and `V1_USE_FASTEMBED=1` is set, blends `BAAI/bge-small-en-v1.5` neural embeddings into the 256-dim L2 vector.
-3. **Reciprocal Rank Fusion (`reciprocal_rank_fusion`)**: Combines sparse token-overlap ranking and dense cosine/concept ranking via `1 / (k + rank)` (`k = 60`), surfacing both exact part-number hits and zero-word-overlap conceptual matches at `>= 25%` while keeping generic coding prompts (`"can you help me fix a bug in this python script I wrote yesterday"`) at `0` matches.
+3. **Reciprocal Rank Fusion (`reciprocal_rank_fusion`)**: Combines sparse token-overlap ranking and dense cosine/concept ranking via `1 / (k + rank)` (`k = 60`), surfacing both exact part-number hits and zero-word-overlap conceptual matches at `>= 40%` while keeping generic coding prompts (`"can you help me fix a bug in this python script I wrote yesterday"`) at `0` matches.
 
 ### Why Incremental Archive Caching Eliminates Disk Bottlenecks
 As conversation history grows across providers, re-parsing `.jsonl` transcripts or re-computing vectors on every run wastes I/O:
 - **Incremental `rebuild_portable_index()`**: Stores `content_hash` and `vector_json` alongside `(last_modified_time, step_count)` in `conversations`. Unchanged sessions are skipped in sub-millisecond time (`get_last_rebuild_stats()` tracks `total`, `updated`, and `skipped`).
 - **Cached Unindexed Antigravity Parents (`antigravity_unindexed_cache`)**: Some parent conversations in Antigravity's `conversation_summaries.db` are absent from `conversations_fts`. On the first encounter, `index_store.py` extracts a `32KB + 32KB` head/tail preview from `transcript.jsonl`, computes the 256-dim semantic vector, and persists the row in `antigravity_unindexed_cache`. Subsequent runs match `(last_modified_time, step_count)` and reuse the cached digest and vector with **zero disk reads** (`get_last_unindexed_cache_stats()` reports `hits` vs `misses`).
 
-### Why `25%` + Curated Coding Stopwords Works Better Than `10%`
+### Why `40%` + Hybrid-RAG + Curated Stopwords Works Better Than `10%` or `25%`
 With `denom = min(len(query_tokens), len(doc_tokens))`, past conversations usually have 100–500+ unique tokens while user prompts have 3–15 domain tokens. That makes `denom` effectively equal to `len(query_tokens)`.
 - At **`10%`**, a long 18–20 token prompt only needed 2 incidental words (like `script` and `yesterday`) to hit `10%`.
-- Adding generic software/time stopwords (`bug`, `code`, `script`, `python`, `system`, `repo`, `yesterday`) and keeping mixed chip/board codes whole (`stm32` stays `stm32` instead of splitting out noisy `'32'`) removes accidental overlaps.
-- Raising the default threshold to **`25%`** preserves all specific queries (`2/5 = 40%`, `2/8 = 25%`, `3/10 = 30%`) while rejecting stray coincidental overlaps.
+- Adding generic software/workflow stopwords (`bug`, `code`, `script`, `python`, `system`, `repo`, `model`, `prompt`, `yesterday`) and keeping mixed chip/board codes whole (`stm32` stays `stm32` instead of splitting out noisy `'32'`) removes accidental overlaps.
+- With **Hybrid-RAG**, `concept_cov` and `cosine_sim` lift genuine exact and synonym matches into the **`50%–100%`** band, while weak broad-cluster collisions (e.g., overlapping on a single security cluster) sit around **`29%–34%`**. Raising the default threshold from `25%` to **`40%`** eliminates that noise band cleanly without losing genuine matches.
 
 ### Why a Tumbling 5-Prompt Window Beats Whole-Convo Re-Checks
 Evaluating every single prompt interrupts active work. Evaluating only prompt `#5` misses a topic shift that started on prompt `#3` followed by short follow-ups (`"why timeout?"`, `"try again"`).

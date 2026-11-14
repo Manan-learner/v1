@@ -16,14 +16,14 @@ TOOLS = [
         "name": "find_context",
         "description": (
             "Search past conversations across Antigravity CLI, Claude Code, Codex CLI, and custom logs by domain token "
-            "overlap (default >= 25%). Returns top 3 matches with brief summaries so the assistant can ask user permission "
+            "overlap (default >= 40%). Returns top 3 matches with brief summaries so the assistant can ask user permission "
             "BEFORE calling recall_conversation."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "User prompt or topic keywords"},
-                "threshold_pct": {"type": "number", "default": 25.0},
+                "threshold_pct": {"type": "number", "default": 40.0},
                 "provider": {"type": "string", "default": "all"},
                 "current_conversation_id": {"type": "string", "default": ""},
             },
@@ -93,7 +93,7 @@ def handle_rpc(req: dict[str, Any], home: Path | None = None, state_home: Path |
             tokens, matches = find_context_matches(
                 args.get("query", ""),
                 current_conv_id=args.get("current_conversation_id", ""),
-                threshold_pct=float(args.get("threshold_pct", 25.0)),
+                threshold_pct=float(args.get("threshold_pct", 40.0)),
                 provider_filter=args.get("provider", "all"),
                 home=home,
                 state_home=resolved,

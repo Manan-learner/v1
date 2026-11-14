@@ -594,7 +594,7 @@ def _load_configured_synonyms(state_home: Path) -> dict[str, list[str]]:
 def find_context_matches(
     prompt_text: str,
     current_conv_id: str = "",
-    threshold_pct: float = 25.0,
+    threshold_pct: float = 40.0,
     min_matched_tokens: int = 2,
     max_matches: int = 3,
     exclude_ids: set[str] | None = None,

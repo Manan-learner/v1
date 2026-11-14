@@ -15,7 +15,7 @@ from v1_memory.text_utils import clean_snippet, clean_user_prompt, tokenize_doma
 
 DEFAULT_CONFIG = {
     "enabled": True,
-    "threshold_pct": 25.0,
+    "threshold_pct": 40.0,
     "min_matched_tokens": 2,
     "max_matches": 3,
     "start_of_convo_only": True,
@@ -261,7 +261,7 @@ def run_hook_payload(
         return detected_fmt, None, []
 
     min_matched = int(cfg.get("min_matched_tokens", 2))
-    threshold_pct = float(cfg.get("threshold_pct", 25.0))
+    threshold_pct = float(cfg.get("threshold_pct", 40.0))
     max_matches = int(cfg.get("max_matches", 3))
     auto_pivot_n = int(cfg.get("auto_pivot_every_n_prompts", 5))
     start_only = bool(cfg.get("start_of_convo_only", True))
@@ -397,7 +397,7 @@ def main() -> int:
     parser.add_argument("--pivot", metavar="TOPIC", help="Check a mid-conversation topic pivot cleanly")
     parser.add_argument("--prompt", metavar="PROMPT", help="Direct non-hook prompt check (returns JSON)")
     parser.add_argument("--conv", default="", help="Current conversation/session ID to exclude")
-    parser.add_argument("--threshold", type=float, default=25.0, help="Match percentage threshold (default: 25.0)")
+    parser.add_argument("--threshold", type=float, default=40.0, help="Match percentage threshold (default: 40.0)")
     parser.add_argument("--provider", default="all", help="all, antigravity, claude, codex, generic")
     parser.add_argument("--format", default="auto", choices=["auto", "antigravity", "claude", "generic", "plain"])
     parser.add_argument("--reindex", action="store_true", help="Refresh ~/.v1-memory/index.db for non-Antigravity transcripts")
