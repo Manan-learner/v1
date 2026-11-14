@@ -1,6 +1,6 @@
 # Architecture & Why It Works
 
-## 1. Proactive Context Matching Pipeline
+## 1. Proactive Hybrid-RAG Context Matching Pipeline (`v2`)
 
 ```
 Incoming prompt (Antigravity PreInvocation / Claude UserPromptSubmit / MCP / CLI)
@@ -14,16 +14,37 @@ Incoming prompt (Antigravity PreInvocation / Claude UserPromptSubmit / MCP / CLI
    │     └─ Every 5th user prompt (tumbling batch: pending_prompts vs prev_window_tokens)
    │
    ▼
-FTS5 Search + Fallback (~115–250 ms, $0 LLM calls)
-   ├─► Native Antigravity DB: conversations_fts (LIMIT 250 chunks) + unindexed parent fallback
-   ├─► Portable multi-LLM DB (~/.v1-memory/index.db): Claude Code, Codex CLI, custom JSONL/MD
-   └─► Score: len(matched) / min(len(q_tokens), len(doc_tokens)) >= 25% & matched >= 2
+Hybrid-RAG Search + Incremental Cache (~50–200 ms, $0 LLM calls)
+   ├─► Concept Expansion: Built-in technical clusters (rf_telemetry, can_embedded, k8s_containers,
+   │   auth_security, database_storage, cloud_backup_sync) + user "synonyms" expand query recall
+   ├─► Sparse Leg: Native Antigravity FTS5 (LIMIT 250 chunks) + Portable ~/.v1-memory/index.db FTS5
+   ├─► Dense / Semantic Leg: 2-tier 256-dim L2-normalized semantic vector
+   │     ├─ Tier 1 (optional): fastembed (BAAI/bge-small-en-v1.5) when V1_USE_FASTEMBED=1
+   │     └─ Tier 2 (default zero-dep): Deterministic CRC32 feature-hashed L2 vector combining
+   │        domain tokens (1.0x), canonical concept IDs (2.5x), and char 4-grams (0.5x)
+   ├─► Incremental Archive Cache:
+   │     ├─ conversations table caches content_hash + vector_json (skips unchanged mtime + step_count)
+   │     └─ antigravity_unindexed_cache table caches unindexed parent digests + vectors (0 disk re-reads)
+   └─► Reciprocal Rank Fusion (RRF): Fuses sparse + dense ranks & scores hybrid_pct >= 25%
    │
    ▼
 Top-3 Summary + Permission Gate
-   └─► Assistant prints top 3 titles, dates, % overlap, matched tokens, brief summary,
+   └─► Assistant prints top 3 titles, dates, % overlap, matched tokens/concepts, brief summary,
        and MUST ask permission before invoking v1-recall --show <id>
 ```
+
+### Why v2 Hybrid-RAG Beats Keyword-Only FTS5
+Pure lexical matching fails when a user describes a problem with different terminology than the original session (for example, asking about `"wireless radio rssi link dropouts"` when the earlier conversation used `"915MHz SX1262 transceiver packet framing"`).
+1. **Concept & Synonym Expansion (`expand_with_concepts`)**: Maps domain vocabulary into canonical concept IDs (`concept:rf_telemetry`, `concept:can_embedded`, `concept:k8s_containers`, `concept:auth_security`, `concept:database_storage`, `concept:cloud_backup_sync`, plus user-defined `"synonyms"` in `context_finder_config.json`).
+2. **2-Tier 256-Dim L2 Semantic Vectors (`compute_semantic_vector`)**:
+   - **Zero-Dependency Default**: Uses deterministic CRC32 feature hashing with signed projections across domain tokens (`1.0x`), multi-hash canonical concept IDs (`2.5x`), and character 4-grams (`0.5x`) for sub-word/part-number resilience (`sx1262` vs `sx1276`, `stm32h7` vs `stm32f4`).
+   - **Optional Neural Tier**: If `pip install -e ".[rag]"` (`fastembed>=0.3.0`) is installed and `V1_USE_FASTEMBED=1` is set, blends `BAAI/bge-small-en-v1.5` neural embeddings into the 256-dim L2 vector.
+3. **Reciprocal Rank Fusion (`reciprocal_rank_fusion`)**: Combines sparse token-overlap ranking and dense cosine/concept ranking via `1 / (k + rank)` (`k = 60`), surfacing both exact part-number hits and zero-word-overlap conceptual matches at `>= 25%` while keeping generic coding prompts (`"can you help me fix a bug in this python script I wrote yesterday"`) at `0` matches.
+
+### Why Incremental Archive Caching Eliminates Disk Bottlenecks
+As conversation history grows across providers, re-parsing `.jsonl` transcripts or re-computing vectors on every run wastes I/O:
+- **Incremental `rebuild_portable_index()`**: Stores `content_hash` and `vector_json` alongside `(last_modified_time, step_count)` in `conversations`. Unchanged sessions are skipped in sub-millisecond time (`get_last_rebuild_stats()` tracks `total`, `updated`, and `skipped`).
+- **Cached Unindexed Antigravity Parents (`antigravity_unindexed_cache`)**: Some parent conversations in Antigravity's `conversation_summaries.db` are absent from `conversations_fts`. On the first encounter, `index_store.py` extracts a `32KB + 32KB` head/tail preview from `transcript.jsonl`, computes the 256-dim semantic vector, and persists the row in `antigravity_unindexed_cache`. Subsequent runs match `(last_modified_time, step_count)` and reuse the cached digest and vector with **zero disk reads** (`get_last_unindexed_cache_stats()` reports `hits` vs `misses`).
 
 ### Why `25%` + Curated Coding Stopwords Works Better Than `10%`
 With `denom = min(len(query_tokens), len(doc_tokens))`, past conversations usually have 100–500+ unique tokens while user prompts have 3–15 domain tokens. That makes `denom` effectively equal to `len(query_tokens)`.

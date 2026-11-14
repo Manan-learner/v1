@@ -22,6 +22,9 @@ DEFAULT_CONFIG = {
     "max_initial_steps_for_start": 4,
     "auto_pivot_every_n_prompts": 5,
     "call_words": ["@context", "#context", "check context", "recall check", "find context"],
+    "hybrid_rag": True,
+    "semantic_weight": 0.45,
+    "synonyms": {},
 }
 
 
@@ -263,6 +266,9 @@ def run_hook_payload(
     auto_pivot_n = int(cfg.get("auto_pivot_every_n_prompts", 5))
     start_only = bool(cfg.get("start_of_convo_only", True))
     max_start_steps = int(cfg.get("max_initial_steps_for_start", 4))
+    hybrid_rag = bool(cfg.get("hybrid_rag", True))
+    semantic_weight = float(cfg.get("semantic_weight", 0.45))
+    custom_synonyms = cfg.get("synonyms") if isinstance(cfg.get("synonyms"), dict) else {}
 
     new_prompt_count = state["prompt_count"] + 1
     curr_tokens = tokenize_domain(prompt)
@@ -359,6 +365,9 @@ def run_hook_payload(
         state_home=resolved_state,
         agy_db_path=agy_db_path,
         index_db_path=index_db_path,
+        hybrid_rag=hybrid_rag,
+        semantic_weight=semantic_weight,
+        custom_synonyms=custom_synonyms,
     )
 
     next_pending = [] if reset_pending else updated_pending
@@ -395,8 +404,10 @@ def main() -> int:
     args = parser.parse_args()
 
     state_home = default_state_home()
+    cfg = load_config(state_home)
+    syns = cfg.get("synonyms") if isinstance(cfg.get("synonyms"), dict) else {}
     if args.reindex:
-        count = rebuild_portable_index(state_home / "index.db")
+        count = rebuild_portable_index(state_home / "index.db", custom_synonyms=syns)
         print(f"Indexed {count} non-Antigravity conversation(s) -> {state_home / 'index.db'}", file=sys.stderr)
 
     query_text = args.pivot or args.test or args.prompt
@@ -407,6 +418,9 @@ def main() -> int:
             threshold_pct=args.threshold,
             provider_filter=args.provider,
             state_home=state_home,
+            hybrid_rag=bool(cfg.get("hybrid_rag", True)),
+            semantic_weight=float(cfg.get("semantic_weight", 0.45)),
+            custom_synonyms=syns,
         )
         print(json.dumps({"query_tokens": tokens, "matches": matches}, indent=2))
         return 0

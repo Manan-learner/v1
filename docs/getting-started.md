@@ -42,10 +42,20 @@ Copy or customize [`examples/context_finder_config.json`](../examples/context_fi
   "start_of_convo_only": true,
   "max_initial_steps_for_start": 4,
   "auto_pivot_every_n_prompts": 5,
-  "call_words": ["@context", "#context", "check context", "recall check", "find context"]
+  "call_words": ["@context", "#context", "check context", "recall check", "find context"],
+  "hybrid_rag": true,
+  "semantic_weight": 0.45,
+  "synonyms": {
+    "custom_topic": ["alias1", "alias2"]
+  }
 }
 ```
 
+- **`"hybrid_rag": true`** (default): Enables v2 Hybrid-RAG combining Sparse FTS5 BM25, built-in technical concept clusters + custom `"synonyms"`, 2-tier 256-dim L2 semantic vectors, and Reciprocal Rank Fusion (RRF). Set to `false` for strict exact-token sparse matching only.
+- **`"semantic_weight": 0.45`**: Controls the balance between dense semantic cosine similarity (`0.45`) and concept coverage (`0.55`) when scoring conceptual/synonym matches.
+- **`"synonyms": {}`**: Add project-specific domain clusters (`"cluster_name": ["term1", "term2", ...]`) so related project terms match even when prompts use different words.
+- **Optional Neural Embeddings (`fastembed`)**: The default 256-dim stdlib feature-hashed vector requires zero dependencies. To blend `BAAI/bge-small-en-v1.5` neural embeddings, install `pip install -e ".[rag]"` and set `V1_USE_FASTEMBED=1`.
+- **Incremental Archive Caching**: Both `v1-context --reindex` and unindexed Antigravity parent transcript scans automatically cache digests and 256-dim vectors in `~/.v1-memory/index.db` keyed by `(last_modified_time, step_count)`, avoiding repeated disk reads on unchanged sessions.
 - Set `"auto_pivot_every_n_prompts": 0` to disable periodic mid-chat checks and rely solely on Turn 1 + explicit call words.
 - Increase `"threshold_pct"` to `30.0`–`35.0` if you prefer stricter triggering.
 

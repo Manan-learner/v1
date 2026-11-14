@@ -6,5 +6,10 @@
   "start_of_convo_only": true,
   "max_initial_steps_for_start": 4,
   "auto_pivot_every_n_prompts": 5,
-  "call_words": ["@context", "#context", "check context", "recall check", "find context"]
+  "call_words": ["@context", "#context", "check context", "recall check", "find context"],
+  "hybrid_rag": true,
+  "semantic_weight": 0.45,
+  "synonyms": {
+    "custom_topic": ["alias1", "alias2"]
+  }
 }
