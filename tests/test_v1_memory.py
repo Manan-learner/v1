@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from unittest import mock
@@ -1350,6 +1351,230 @@ class V1MemoryTests(unittest.TestCase):
                 urllib.request.urlopen(bad_req, timeout=5)
             self.assertEqual(ctx.exception.code, 400)
             ctx.exception.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server_thread.join(timeout=2)
+
+    def test_balanced_fts5_quota_and_high_idf_single_token_rescue(self) -> None:
+        # 1. Backward-compatible idf_weights in compute_semantic_vector
+        toks = ["quarterback", "championship", "playoffs"]
+        v_default = compute_semantic_vector(toks)
+        v_none = compute_semantic_vector(toks, idf_weights=None)
+        self.assertEqual(v_default, v_none)
+        v_weighted = compute_semantic_vector(toks, idf_weights={"quarterback": 6.5, "championship": 1.1, "playoffs": 2.0})
+        self.assertEqual(len(v_weighted), 256)
+        self.assertNotEqual(v_default, v_weighted)
+        v_q_only = compute_semantic_vector(["quarterback"])
+        self.assertGreater(cosine_similarity(v_weighted, v_q_only), cosine_similarity(v_default, v_q_only))
+
+        # 2. Balanced FTS5 per-token quota + high-IDF single-token rescue under common-term crowding
+        index_db = self.state_home / "index.db"
+        cache_sig = compute_rag_signature()
+        conn = sqlite3.connect(str(index_db))
+        try:
+            ensure_portable_schema(conn)
+            conv_rows = []
+            fts_rows = []
+            # Insert 55 crowding docs containing "championship" repeated many times (<55% of 125 total docs so not high-DF suppressed)
+            for i in range(120):
+                cid = f"crowd:doc-{i:03d}"
+                if i < 55:
+                    title = f"Tournament Recap #{i}"
+                    body = (
+                        f"championship championship championship medal podium Bracket_{i} "
+                        f"venue_{i} referee_{i} season_{i} league_{i}"
+                    )
+                else:
+                    title = f"Archive Note #{i}"
+                    body = f"unrelated_topic_{i} module_{i} widget_{i} metric_{i} sensor_{i}"
+                tok_list = sorted(set(tokenize_domain(f"{title} {body}")))
+                vec_json = json.dumps(compute_semantic_vector(tok_list))
+                tok_json = json.dumps(tok_list)
+                conv_rows.append(
+                    (
+                        cid,
+                        "generic",
+                        title,
+                        f"2026-10-{(i % 28) + 1:02d} 11:00:00",
+                        6,
+                        "/workspace/sports",
+                        f"/tmp/crowd-{i}.jsonl",
+                        body,
+                        body,
+                        "",
+                        f"crowd_{cache_sig}_{i}",
+                        vec_json,
+                        tok_json,
+                        cache_sig,
+                    )
+                )
+                fts_rows.append((cid, "generic", title, body, ""))
+
+            # Insert 1 rare target doc containing ONLY "quarterback" from the 4-term query
+            rare_cid = "generic:gridiron-rare-01"
+            rare_title = "Varsity Quarterback Passing Mechanics"
+            rare_body = "quarterback pocket footwork cadence spiralblitz audible"
+            rare_toks = sorted(set(tokenize_domain(f"{rare_title} {rare_body}")))
+            conv_rows.append(
+                (
+                    rare_cid,
+                    "generic",
+                    rare_title,
+                    "2026-10-01 08:00:00",
+                    8,
+                    "/workspace/sports",
+                    "/tmp/rare.jsonl",
+                    rare_body,
+                    rare_body,
+                    "",
+                    f"rare_{cache_sig}",
+                    json.dumps(compute_semantic_vector(rare_toks)),
+                    json.dumps(rare_toks),
+                    cache_sig,
+                )
+            )
+            fts_rows.append((rare_cid, "generic", rare_title, rare_body, ""))
+
+            conn.executemany(
+                "INSERT OR REPLACE INTO conversations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                conv_rows,
+            )
+            conn.executemany(
+                "INSERT INTO conversations_fts (conversation_id, provider, title, user_text, agent_text) VALUES (?, ?, ?, ?, ?)",
+                fts_rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        _, matches = find_context_matches(
+            "quarterback touchdown championship playoffs",
+            threshold_pct=35.0,
+            home=self.home,
+            state_home=self.state_home,
+        )
+        self.assertTrue(matches, "Expected rare 'quarterback' doc to be rescued via balanced FTS5 quota + high-IDF rescue")
+        self.assertEqual(matches[0]["conversation_id"], rare_cid)
+        self.assertIn("quarterback", matches[0]["matched_tokens"])
+
+        # Common single-token overlap (DF=55/123 > 15% max DF ratio) must NOT be rescued
+        _, common_only = find_context_matches(
+            "championship nonexistent_xyz_token_999",
+            threshold_pct=35.0,
+            home=self.home,
+            state_home=self.state_home,
+        )
+        self.assertEqual(common_only, [])
+
+    def test_whitened_pca_parity_dynamic_kmeans_and_slim_graph_node_api(self) -> None:
+        from v1_memory.visualizer import (
+            build_public_graph,
+            collect_vector_corpus,
+            create_visualizer_server,
+            fit_pca_3d,
+            project_vector_3d,
+        )
+
+        # Build >= 16 diverse non-DEFAULT_CONCEPT_CLUSTERS documents across 4 distinct domains
+        diverse_topics = [
+            ("Astrophysics Supernova #" + str(i), "supernova pulsar magnetar redshift parsec luminosity nebula quasar")
+            for i in range(4)
+        ] + [
+            ("Molecular Ribosome #" + str(i), "ribosome polymerase transcription codon mrna peptide enzyme nucleotide")
+            for i in range(4)
+        ] + [
+            ("Macroeconomic Inflation #" + str(i), "inflation bond yield tariff centralbank fiscal monetary liquidity")
+            for i in range(4)
+        ] + [
+            ("Championship Gridiron #" + str(i), "quarterback touchdown playoffs scrimmage linebackerblitz fieldgoal")
+            for i in range(4)
+        ]
+
+        topic_dir = self.root / "diverse_topics"
+        topic_dir.mkdir(parents=True, exist_ok=True)
+        for idx, (title, text) in enumerate(diverse_topics):
+            (topic_dir / f"topic-{idx:02d}.jsonl").write_text(
+                json.dumps({"role": "user", "content": f"{title} {text} sample_{idx}"}) + "\n",
+                encoding="utf-8",
+            )
+        rebuild_portable_index(
+            self.state_home / "index.db",
+            providers=["claude", "codex", "generic"],
+            home=self.home,
+            custom_dirs=[topic_dir],
+        )
+
+        # 1. Whitened PCA projection parity with project_vector_3d
+        state = collect_vector_corpus(home=self.home, state_home=self.state_home, max_docs=100)
+        nodes = state["public_graph"]["nodes"]
+        self.assertEqual(len(nodes), 18)  # 2 setUp fixtures + 16 diverse docs
+        vecs = [state["vectors_by_id"][n["id"]] for n in nodes]
+        pca_res = fit_pca_3d(vecs)
+        self.assertGreater(sum(pca_res["variance_explained"]), 10.0)
+        for idx, v in enumerate(vecs):
+            proj = project_vector_3d(v, pca_res["mean"], pca_res["basis"])
+            self.assertEqual(pca_res["coords"][idx], proj)
+            radius = sum(c * c for c in proj) ** 0.5
+            self.assertLessEqual(radius, 1.0002)
+
+        # 2. Dynamic spherical k-means clustering when >75% of corpus (>= 12 docs) is outside DEFAULT_CONCEPT_CLUSTERS
+        dyn_clusters = [c for c in state["cluster_names"] if c.startswith("topic:")]
+        self.assertGreaterEqual(len(dyn_clusters), 4)
+        general_nodes = [n for n in nodes if n["dominant_concept"] == "general"]
+        self.assertEqual(len(general_nodes), 0)
+        centroid_concepts = {c["concept"] for c in state["centroids"]}
+        self.assertTrue(any(c.startswith("topic:") for c in centroid_concepts))
+
+        # 3. Slim live /api/graph (>400 nodes) vs offline static export (live_api=False)
+        mock_405_nodes = [
+            {
+                "id": f"mock:{i}",
+                "provider": "generic",
+                "title": f"Mock #{i}",
+                "last_modified_time": "2026-11-01 12:00:00",
+                "step_count": 5,
+                "summary": "Detailed summary text",
+                "dominant_concept": "topic:alpha_beta",
+                "concepts": {},
+                "top_tokens": ["alpha", "beta"],
+                "vector_preview": [0.1] * 64,
+                "pos": [0.0, 0.0, 0.0],
+                "knn": [],
+            }
+            for i in range(405)
+        ]
+        large_state = {**state, "public_graph": {**state["public_graph"], "nodes": mock_405_nodes}}
+        slim_graph = build_public_graph(large_state, live_api=True)
+        self.assertEqual(len(slim_graph["nodes"]), 405)
+        for stripped_key in ("summary", "top_tokens", "vector_preview", "concepts"):
+            self.assertNotIn(stripped_key, slim_graph["nodes"][0])
+
+        full_offline_graph = build_public_graph(large_state, live_api=False)
+        for kept_key in ("summary", "top_tokens", "vector_preview", "concepts"):
+            self.assertIn(kept_key, full_offline_graph["nodes"][0])
+
+        # 4. GET /api/node?id=... 200 & 404 behavior
+        httpd, port = create_visualizer_server(state, host="127.0.0.1", port=0, strict_port=True)
+        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            base = f"http://127.0.0.1:{port}"
+            target_id = nodes[0]["id"]
+            with urllib.request.urlopen(f"{base}/api/node?id={urllib.parse.quote(target_id)}", timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                detail = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(detail["id"], target_id)
+                self.assertIn("summary", detail)
+                self.assertIn("top_tokens", detail)
+                self.assertEqual(len(detail["vector_preview"]), 64)
+                self.assertIn("concepts", detail)
+
+            for bad_url in (f"{base}/api/node?id=nonexistent-id-999", f"{base}/api/node"):
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(bad_url, timeout=5)
+                self.assertEqual(ctx.exception.code, 404)
+                ctx.exception.close()
         finally:
             httpd.shutdown()
             httpd.server_close()

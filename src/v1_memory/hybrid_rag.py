@@ -410,10 +410,16 @@ def _l2_normalize(vec: list[float]) -> list[float]:
     return [v / norm for v in vec]
 
 
+def is_fastembed_active() -> bool:
+    """Return True only when Tier-1 external fastembed dense embeddings are enabled and loaded."""
+    return bool(os.environ.get("V1_USE_FASTEMBED") == "1" and _FASTEMBED_MODEL is not None and not _FASTEMBED_FAILED)
+
+
 def _compute_stdlib_vector(
     tokens: Sequence[str],
     custom_synonyms: dict[str, list[str]] | None = None,
     dim: int = VECTOR_DIM,
+    idf_weights: dict[str, float] | None = None,
 ) -> list[float]:
     if not tokens:
         return [0.0] * dim
@@ -430,12 +436,27 @@ def _compute_stdlib_vector(
     vec = [0.0] * dim
 
     # 1. Domain tokens + stems (weight 1.0 / 0.5, group-normalized for length invariance)
-    tok_scale = 1.0 / math.sqrt(len(vec_tokens))
-    for tok in vec_tokens:
-        _hash_add(vec, f"tok:{tok}", 1.0 * tok_scale, dim)
-        stem = stem_token(tok)
-        if stem != tok:
-            _hash_add(vec, f"tok:{stem}", 0.5 * tok_scale, dim)
+    if idf_weights is None:
+        tok_scale = 1.0 / math.sqrt(len(vec_tokens))
+        for tok in vec_tokens:
+            _hash_add(vec, f"tok:{tok}", 1.0 * tok_scale, dim)
+            stem = stem_token(tok)
+            if stem != tok:
+                _hash_add(vec, f"tok:{stem}", 0.5 * tok_scale, dim)
+    else:
+        tok_weights: list[float] = []
+        for tok in vec_tokens:
+            raw_w = idf_weights.get(tok)
+            if raw_w is None:
+                raw_w = idf_weights.get(stem_token(tok), 1.0)
+            tok_weights.append(1.0 + math.log(max(1.0, float(raw_w))))
+        norm_sq = sum(w * w for w in tok_weights)
+        tok_scale = 1.0 / math.sqrt(norm_sq if norm_sq > 1e-12 else len(vec_tokens))
+        for tok, w in zip(vec_tokens, tok_weights):
+            _hash_add(vec, f"tok:{tok}", w * tok_scale, dim)
+            stem = stem_token(tok)
+            if stem != tok:
+                _hash_add(vec, f"tok:{stem}", 0.5 * w * tok_scale, dim)
 
     # 2. Qualified canonical concept IDs (weight 1.6x, 4-projection hash)
     if qualified_concepts:
@@ -458,12 +479,14 @@ def compute_semantic_vector(
     text: str | Iterable[str],
     custom_synonyms: dict[str, list[str]] | None = None,
     dim: int = VECTOR_DIM,
+    idf_weights: dict[str, float] | None = None,
 ) -> list[float]:
     """Compute a 256-dim L2-normalized semantic vector.
 
     Tier 1: Uses `fastembed` (`BAAI/bge-small-en-v1.5`) ONLY if `V1_USE_FASTEMBED=1` and installed.
     Tier 2: Fast deterministic stdlib 256-dim crc32 feature-hashed L2 vector combining domain tokens
-            (1.0x), stems (0.5x), >=2-stem qualified concept IDs (1.6x), and character 4-grams (0.5x).
+            (1.0x, optionally damped log-IDF weighted via `idf_weights`), stems (0.5x), >=2-stem
+            qualified concept IDs (1.6x), and character 4-grams (0.5x).
     """
     global _FASTEMBED_MODEL, _FASTEMBED_FAILED
 
@@ -472,7 +495,12 @@ def compute_semantic_vector(
     else:
         tokens = [str(x).lower().strip() for x in text if str(x).strip()]
 
-    stdlib_vec = _compute_stdlib_vector(tokens, custom_synonyms=custom_synonyms, dim=dim)
+    stdlib_vec = _compute_stdlib_vector(
+        tokens,
+        custom_synonyms=custom_synonyms,
+        dim=dim,
+        idf_weights=idf_weights,
+    )
 
     if os.environ.get("V1_USE_FASTEMBED") == "1" and not _FASTEMBED_FAILED:
         try:

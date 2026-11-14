@@ -1094,7 +1094,15 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       general: "#94a3b8"
     };
 
-    const EXTRA_COLORS = ["#f472b6", "#a3e635", "#fb923c", "#60a5fa", "#e879f9", "#34d399"];
+    const EXTRA_COLORS = [
+      "#f472b6", "#a3e635", "#fb923c", "#60a5fa", "#e879f9",
+      "#34d399", "#facc15", "#f87171", "#c084fc", "#4ade80",
+      "#fbbf24", "#2dd4bf", "#f97316", "#38bdf8", "#fb7185",
+      "#818cf8", "#ec4899", "#84cc16", "#06b6d4", "#d946ef"
+    ];
+
+    const DYNAMIC_CLUSTER_COLOR_CACHE = new Map();
+    const USED_DYNAMIC_HEX = new Set();
 
     const PROVIDER_COLORS = {
       antigravity: "#22d3ee",
@@ -1112,6 +1120,27 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       return h >>> 0;
     }
 
+    function hslToHex(h, s, l) {
+      const hue = ((Number(h) % 360) + 360) % 360;
+      const sat = Math.max(0, Math.min(100, Number(s))) / 100;
+      const lig = Math.max(0, Math.min(100, Number(l))) / 100;
+      const c = (1 - Math.abs(2 * lig - 1)) * sat;
+      const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+      const m = lig - c * 0.5;
+      let r1 = 0, g1 = 0, b1 = 0;
+      if (hue < 60) { r1 = c; g1 = x; b1 = 0; }
+      else if (hue < 120) { r1 = x; g1 = c; b1 = 0; }
+      else if (hue < 180) { r1 = 0; g1 = c; b1 = x; }
+      else if (hue < 240) { r1 = 0; g1 = x; b1 = c; }
+      else if (hue < 300) { r1 = x; g1 = 0; b1 = c; }
+      else { r1 = c; g1 = 0; b1 = x; }
+      const toHex = function(v) {
+        const byte = Math.max(0, Math.min(255, Math.round((v + m) * 255)));
+        return byte.toString(16).padStart(2, "0");
+      };
+      return "#" + toHex(r1) + toHex(g1) + toHex(b1);
+    }
+
     function stripConceptPrefix(name) {
       const s = String(name || "general").trim();
       return s.startsWith("concept:") ? s.slice(8) : s;
@@ -1120,7 +1149,25 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     function clusterColor(name) {
       const key = stripConceptPrefix(name).toLowerCase();
       if (CLUSTER_COLORS[key]) return CLUSTER_COLORS[key];
-      return EXTRA_COLORS[hashString(key) % EXTRA_COLORS.length];
+      if (DYNAMIC_CLUSTER_COLOR_CACHE.has(key)) {
+        return DYNAMIC_CLUSTER_COLOR_CACHE.get(key);
+      }
+      const h = hashString(key);
+      for (let probe = 0; probe < EXTRA_COLORS.length; probe++) {
+        const cand = EXTRA_COLORS[(h + probe * 7) % EXTRA_COLORS.length];
+        if (!USED_DYNAMIC_HEX.has(cand)) {
+          USED_DYNAMIC_HEX.add(cand);
+          DYNAMIC_CLUSTER_COLOR_CACHE.set(key, cand);
+          return cand;
+        }
+      }
+      const hue = (h % 360 + DYNAMIC_CLUSTER_COLOR_CACHE.size * 137.508) % 360;
+      const sat = 74 + (h % 14);
+      const lig = 58 + ((h >>> 8) % 12);
+      const hex = hslToHex(hue, sat, lig);
+      USED_DYNAMIC_HEX.add(hex);
+      DYNAMIC_CLUSTER_COLOR_CACHE.set(key, hex);
+      return hex;
     }
 
     function providerColor(name) {
@@ -1183,19 +1230,25 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     const NODES = RAW_NODES.map(function(n, idx) {
       const dom = stripConceptPrefix(n.dominant_concept || "general");
       const pos = safePos(n.pos);
+      const hasInlineSummary = n.summary !== undefined && n.summary !== null;
+      const topToks = Array.isArray(n.top_tokens) ? n.top_tokens.map(String) : [];
+      const vecPrev = Array.isArray(n.vector_preview) ? n.vector_preview.map(Number) : [];
       return {
         id: String(n.id || ("node-" + idx)),
         provider: String(n.provider || "generic").toLowerCase(),
         title: String(n.title || n.id || "Untitled Conversation"),
         last_modified_time: String(n.last_modified_time || ""),
         step_count: Math.max(1, Number(n.step_count) || 1),
-        summary: String(n.summary || ""),
+        summary: hasInlineSummary ? String(n.summary) : undefined,
         dominant_concept: dom,
         concepts: n.concepts && typeof n.concepts === "object" ? n.concepts : {},
-        top_tokens: Array.isArray(n.top_tokens) ? n.top_tokens.map(String) : [],
-        vector_preview: Array.isArray(n.vector_preview) ? n.vector_preview.map(Number) : [],
+        top_tokens: topToks,
+        vector_preview: vecPrev,
         pos: pos,
-        knn: Array.isArray(n.knn) ? n.knn : []
+        knn: Array.isArray(n.knn) ? n.knn : [],
+        _hydrated: Boolean(hasInlineSummary && vecPrev.length > 0),
+        _hydrating: false,
+        _hydrateError: null
       };
     });
 
@@ -1209,6 +1262,17 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
         pos: safePos(c.pos)
       };
     });
+
+    // Pre-warm dynamic cluster colors in deterministic sorted order across graph clusters
+    (function() {
+      const allClusterKeys = new Set();
+      if (Array.isArray(GRAPH.cluster_names)) {
+        GRAPH.cluster_names.forEach(function(cn) { allClusterKeys.add(stripConceptPrefix(cn)); });
+      }
+      CENTROIDS.forEach(function(c) { if (c.concept) allClusterKeys.add(c.concept); });
+      NODES.forEach(function(n) { if (n.dominant_concept) allClusterKeys.add(n.dominant_concept); });
+      Array.from(allClusterKeys).sort().forEach(function(k) { clusterColor(k); });
+    })();
 
     const UNIQUE_EDGES = [];
     const edgeSeen = new Set();
@@ -1488,21 +1552,25 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       return Math.max(-1, Math.min(1, dot / (Math.sqrt(na) * Math.sqrt(nb))));
     }
 
-    const OFFLINE_DF = (function() {
+    let _offlineDfCache = null;
+    function getOfflineDf() {
+      if (_offlineDfCache) return _offlineDfCache;
       const df = new Map();
       NODES.forEach(function(n) {
         const toks = new Set(
-          n.top_tokens.concat(tokenizeDomainOffline(n.title + " " + n.summary)).map(stemToken)
+          (n.top_tokens || []).concat(tokenizeDomainOffline(n.title + " " + (n.summary || ""))).map(stemToken)
         );
         toks.forEach(function(t) {
           df.set(t, (df.get(t) || 0) + 1);
         });
       });
+      _offlineDfCache = df;
       return df;
-    })();
+    }
 
     function runOfflineQuery(queryText, thresholdPct, hybridRag) {
       const t0 = performance.now();
+      const offlineDf = getOfflineDf();
       const qTokens = tokenizeDomainOffline(queryText);
       const qConcepts = offlineGroupConcepts(qTokens);
       const qStems = qTokens.map(stemToken);
@@ -1510,7 +1578,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       const nTotal = Math.max(1, NODES.length);
 
       function idf(stem) {
-        const df = OFFLINE_DF.get(stem) || 0;
+        const df = offlineDf.get(stem) || 0;
         return Math.log(1 + (nTotal - df + 0.5) / (df + 0.5));
       }
 
@@ -1518,7 +1586,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       const scored = [];
 
       for (const node of NODES) {
-        const docToks = new Set(node.top_tokens.concat(tokenizeDomainOffline(node.title + " " + node.summary)));
+        const docToks = new Set((node.top_tokens || []).concat(tokenizeDomainOffline(node.title + " " + (node.summary || ""))));
         const docStems = new Set(Array.from(docToks).map(stemToken));
         const matched = [];
         let matchedW = 0;
@@ -1533,7 +1601,10 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         const exactPct = qTokens.length ? Math.min(100, (matchedW / qIdfSum) * 100) : 0;
-        const previewCos = Math.max(0, cosineSim(qPreview, node.vector_preview));
+        const nodeVecPrev = (Array.isArray(node.vector_preview) && node.vector_preview.length)
+          ? node.vector_preview
+          : offlineVectorPreview(Array.from(docToks));
+        const previewCos = Math.max(0, cosineSim(qPreview, nodeVecPrev));
 
         let conceptBoost = 0;
         const conceptTags = [];
@@ -1753,6 +1824,39 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       return { w: Math.ceil(metrics.width + padX * 2), h: 20 };
     }
 
+    const SPHERE_SPRITES = new Map();
+    function getSphereSprite(col) {
+      let sp = SPHERE_SPRITES.get(col);
+      if (sp) return sp;
+      const size = 64;
+      const half = size * 0.5;
+      const rad = half - 4;
+      const off = document.createElement("canvas");
+      off.width = size;
+      off.height = size;
+      const octx = off.getContext("2d");
+      const sphereGrad = octx.createRadialGradient(
+        half - rad * 0.32,
+        half - rad * 0.32,
+        rad * 0.08,
+        half,
+        half,
+        rad
+      );
+      sphereGrad.addColorStop(0, "#ffffff");
+      sphereGrad.addColorStop(0.28, col);
+      sphereGrad.addColorStop(1, rgba(col, 0.32));
+      octx.fillStyle = sphereGrad;
+      octx.beginPath();
+      octx.arc(half, half, rad, 0, Math.PI * 2);
+      octx.fill();
+      octx.lineWidth = 1.25;
+      octx.strokeStyle = "rgba(255, 255, 255, 0.24)";
+      octx.stroke();
+      SPHERE_SPRITES.set(col, off);
+      return off;
+    }
+
     function drawRoundLabel(text, x, y, strokeHex, bgAlpha, textColor, fontSpec) {
       const fontStr = fontSpec || '600 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
       const dim = measureRoundLabel(text, fontStr);
@@ -1779,11 +1883,13 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       ctx.fillText(text, x, y + 0.5);
     }
 
-    function placeDeoverlappedBox(anchorX, anchorY, w, h, placedBoxes, offsets) {
+    function placeDeoverlappedBox(anchorX, anchorY, w, h, placedBoxes, offsets, opts) {
       const marginX = Math.max(w * 0.5 + 8, 12);
       const maxX = Math.max(marginX, viewW - marginX);
       const minY = Math.min(viewH - 28, Math.max(hudOffsetPx + 14, 78));
       const maxY = Math.max(minY, viewH - 22);
+      const padX = (opts && opts.padX !== undefined) ? opts.padX : 6;
+      const padY = (opts && opts.padY !== undefined) ? opts.padY : 4;
       const candList = offsets || [
         [0, 0],
         [0, -24],
@@ -1802,26 +1908,31 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       let bestX = Math.max(marginX, Math.min(maxX, anchorX));
       let bestY = Math.max(minY, Math.min(maxY, anchorY));
       let bestScore = Infinity;
+      let bestHitArea = Infinity;
 
       for (const off of candList) {
         const cx = Math.max(marginX, Math.min(maxX, anchorX + off[0]));
         const cy = Math.max(minY, Math.min(maxY, anchorY + off[1]));
         let hitArea = 0;
         for (const p of placedBoxes) {
-          const ox = Math.max(0, Math.min(cx + w * 0.5, p.x + p.w * 0.5) - Math.max(cx - w * 0.5, p.x - p.w * 0.5) + 6);
-          const oy = Math.max(0, Math.min(cy + h * 0.5, p.y + p.h * 0.5) - Math.max(cy - h * 0.5, p.y - p.h * 0.5) + 4);
+          const ox = Math.max(0, Math.min(cx + w * 0.5, p.x + p.w * 0.5) - Math.max(cx - w * 0.5, p.x - p.w * 0.5) + padX);
+          const oy = Math.max(0, Math.min(cy + h * 0.5, p.y + p.h * 0.5) - Math.max(cy - h * 0.5, p.y - p.h * 0.5) + padY);
           if (ox > 0 && oy > 0) hitArea += ox * oy;
         }
         const distPenalty = Math.hypot(cx - anchorX, cy - anchorY) * 0.35;
         const score = hitArea * 100 + distPenalty;
         if (score < bestScore) {
           bestScore = score;
+          bestHitArea = hitArea;
           bestX = cx;
           bestY = cy;
         }
         if (hitArea === 0) break;
       }
-      const box = { x: bestX, y: bestY, w: w, h: h };
+      if (opts && opts.maxHitArea !== undefined && bestHitArea > opts.maxHitArea) {
+        return null;
+      }
+      const box = { x: bestX, y: bestY, w: w, h: h, hitArea: bestHitArea };
       placedBoxes.push(box);
       return box;
     }
@@ -1941,6 +2052,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       if (state.showCentroids && state.colorBy === "cluster") {
         for (const c of CENTROIDS) {
           if (state.activeFilter && c.concept !== state.activeFilter) continue;
+          if (!state.activeFilter && (Number(c.count) || 0) <= 0) continue;
           const cp = projectPoint(c.pos);
           if (!cp) continue;
           const col = clusterColor(c.concept);
@@ -1973,14 +2085,31 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
       }
 
-      // 4. Soft dashed 256D k-NN edges
+      // 4. Soft dashed 256D k-NN edges (batched fast path above 1,200 edges for 60fps orbit)
       if (state.showKnn || activeFocusId) {
         ctx.save();
+        const batchAmbient = UNIQUE_EDGES.length > 1200;
+        if (batchAmbient && state.showKnn && !pointer.dragging) {
+          ctx.beginPath();
+          for (const edge of UNIQUE_EDGES) {
+            if (activeFocusId && (edge.a === activeFocusId || edge.b === activeFocusId)) continue;
+            const pa = projMap.get(edge.a);
+            const pb = projMap.get(edge.b);
+            if (!pa || !pb) continue;
+            if (state.activeFilter && !(isNodeHighlightedByFilter(pa.node) || isNodeHighlightedByFilter(pb.node))) continue;
+            ctx.moveTo(pa.sx, pa.sy);
+            ctx.lineTo(pb.sx, pb.sy);
+          }
+          ctx.lineWidth = 0.7;
+          ctx.strokeStyle = "rgba(148, 163, 184, 0.11)";
+          ctx.stroke();
+        }
         for (const edge of UNIQUE_EDGES) {
+          const isFocusedEdge = activeFocusId && (edge.a === activeFocusId || edge.b === activeFocusId);
+          if (batchAmbient && !isFocusedEdge) continue;
           const pa = projMap.get(edge.a);
           const pb = projMap.get(edge.b);
           if (!pa || !pb) continue;
-          const isFocusedEdge = activeFocusId && (edge.a === activeFocusId || edge.b === activeFocusId);
           if (!state.showKnn && !isFocusedEdge) continue;
 
           if (isFocusedEdge) {
@@ -2036,12 +2165,15 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
           renderItems.push(qProj);
 
           const matches = Array.isArray(state.queryResult.matches) ? state.queryResult.matches : [];
+          const fracTable = [0.50, 0.38, 0.62, 0.44, 0.56, 0.34, 0.66, 0.48];
           ctx.save();
-          for (const m of matches) {
+          for (let mIdx = 0; mIdx < matches.length; mIdx++) {
+            const m = matches[mIdx];
             const targetId = m.conversation_id || m.id;
             const targetProj = projMap.get(targetId);
             if (!targetProj) continue;
-            const scoreFrac = Math.max(0.25, Math.min(1, (Number(m.match_pct) || 40) / 100));
+            const scoreVal = Number(m.match_pct) || 0;
+            const scoreFrac = Math.max(0.25, Math.min(1, (scoreVal || 40) / 100));
 
             // Outer beam glow
             ctx.beginPath();
@@ -2062,10 +2194,21 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
             ctx.strokeStyle = "#fde68a";
             ctx.stroke();
 
+            const bFrac = matches.length >= 5 ? fracTable[mIdx % fracTable.length] : 0.5;
+            const dx = targetProj.sx - qp.sx;
+            const dy = targetProj.sy - qp.sy;
+            const bLen = Math.hypot(dx, dy);
+            const normShift = (matches.length >= 5 && bLen > 24)
+              ? (((mIdx % 2 === 0) ? 1 : -1) * 8)
+              : 0;
+            const nx = bLen > 1 ? (-dy / bLen) * normShift : 0;
+            const ny = bLen > 1 ? (dx / bLen) * normShift : 0;
+
             beamBadges.push({
-              text: Math.round(Number(m.match_pct) || 0) + "%",
-              x: (qp.sx + targetProj.sx) * 0.5,
-              y: (qp.sy + targetProj.sy) * 0.5
+              text: Math.round(scoreVal) + "%",
+              score: scoreVal,
+              x: qp.sx + dx * bFrac + nx,
+              y: qp.sy + dy * bFrac + ny
             });
           }
           ctx.restore();
@@ -2077,6 +2220,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       const queryActive = Boolean(state.queryResult);
       const visibleLabels = [];
+      const sphereObstacles = [];
       let queryStarLabel = null;
       projectedNodes = [];
 
@@ -2097,6 +2241,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
           const starSpin = REDUCED_MOTION ? 0 : t * 0.4;
           drawStar(item.sx, item.sy, item.r * (0.95 + pulse * 0.12), item.r * 0.36, 4, starSpin, "#ffffff", "#fbbf24");
           queryStarLabel = { x: item.sx, y: item.sy - item.r - 15 };
+          sphereObstacles.push({ x: item.sx, y: item.sy, w: item.r * 1.8, h: item.r * 1.8 });
           continue;
         }
 
@@ -2117,7 +2262,6 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
           alpha = Math.min(alpha, 0.24);
         }
 
-        ctx.save();
         ctx.globalAlpha = alpha;
 
         // Soft outer glow for selected / hovered / matched nodes
@@ -2133,34 +2277,25 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
           ctx.fill();
         }
 
-        // Radial specular glow sphere
-        const specX = item.sx - item.r * 0.32;
-        const specY = item.sy - item.r * 0.32;
-        const sphereGrad = ctx.createRadialGradient(specX, specY, item.r * 0.08, item.sx, item.sy, item.r);
-        sphereGrad.addColorStop(0, "#ffffff");
-        sphereGrad.addColorStop(0.28, col);
-        sphereGrad.addColorStop(1, rgba(col, 0.32));
-        ctx.fillStyle = sphereGrad;
-        ctx.beginPath();
-        ctx.arc(item.sx, item.sy, item.r, 0, Math.PI * 2);
-        ctx.fill();
+        // Blit cached pre-shaded specular 3D sphere sprite (scales cleanly to 5,000+ nodes at 60fps)
+        const sprite = getSphereSprite(col);
+        const drawR = item.r * (32 / 28);
+        ctx.drawImage(sprite, item.sx - drawR, item.sy - drawR, drawR * 2, drawR * 2);
 
-        // Crisp rim ring
+        // Crisp highlight rim ring only for interactive/matched/neighbor nodes
         if (isSelected || isHovered || matchObj || isNeighbor) {
           ctx.beginPath();
           ctx.arc(item.sx, item.sy, item.r + (isSelected ? 2.5 : 1.5), 0, Math.PI * 2);
           ctx.lineWidth = isSelected ? 2.0 : 1.25;
           ctx.strokeStyle = isSelected ? "#ffffff" : (matchObj ? "#fde68a" : col);
           ctx.stroke();
-        } else {
-          ctx.beginPath();
-          ctx.arc(item.sx, item.sy, item.r, 0, Math.PI * 2);
-          ctx.lineWidth = 0.75;
-          ctx.strokeStyle = "rgba(255, 255, 255, 0.24)";
-          ctx.stroke();
         }
 
-        ctx.restore();
+        ctx.globalAlpha = 1;
+
+        if (isSelected || isHovered || matchObj) {
+          sphereObstacles.push({ x: item.sx, y: item.sy, w: item.r * 1.8, h: item.r * 1.8 });
+        }
 
         if (isSelected || isHovered || matchObj || (state.showLabels && filterOk)) {
           visibleLabels.push({
@@ -2173,14 +2308,16 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
 
       // Unified screen-space label placement (de-overlapped across query star, beam badges, node labels, centroids)
-      const placedBoxes = [];
+      const placedBoxes = sphereObstacles.slice();
 
       if (queryStarLabel) {
         const qDim = measureRoundLabel("QUERY");
         const qBox = placeDeoverlappedBox(queryStarLabel.x, queryStarLabel.y, qDim.w, qDim.h, placedBoxes, [
           [0, 0], [0, -24], [38, -12], [-38, -12], [0, 28]
         ]);
-        drawRoundLabel("QUERY", qBox.x, qBox.y, "rgba(251, 191, 36, 0.88)", 0.94, "#fef3c7");
+        if (qBox) {
+          drawRoundLabel("QUERY", qBox.x, qBox.y, "rgba(251, 191, 36, 0.88)", 0.94, "#fef3c7");
+        }
       }
 
       // Draw crisp non-crowded node labels (highest priority first; de-overlap ALL priorities!)
@@ -2188,6 +2325,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
         if (b.priority !== a.priority) return b.priority - a.priority;
         return a.item.vz - b.item.vz;
       });
+      const highPriorityLabelCount = visibleLabels.filter(function(l) { return l.priority >= 2; }).length;
       let ambientDrawn = 0;
       for (const lbl of visibleLabels) {
         if (lbl.priority === 1 && ambientDrawn >= 24) continue;
@@ -2212,7 +2350,27 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
           continue;
         }
 
-        const box = placeDeoverlappedBox(anchorX, anchorY, dim.w, dim.h, placedBoxes, [
+        const labelOffsets = highPriorityLabelCount >= 5 ? [
+          [0, 0],
+          [0, -26],
+          [0, (lbl.item.r + 16) * 2],
+          [64, -20],
+          [-64, -20],
+          [82, 14],
+          [-82, 14],
+          [0, -54],
+          [0, 58],
+          [116, -32],
+          [-116, -32],
+          [116, 28],
+          [-116, 28],
+          [0, -82],
+          [0, 86],
+          [148, -16],
+          [-148, -16],
+          [148, 42],
+          [-148, 42]
+        ] : [
           [0, 0],
           [0, -26],
           [0, (lbl.item.r + 16) * 2],
@@ -2226,7 +2384,9 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
           [-110, -28],
           [0, -78],
           [0, 82]
-        ]);
+        ];
+        const box = placeDeoverlappedBox(anchorX, anchorY, dim.w, dim.h, placedBoxes, labelOffsets);
+        if (!box) continue;
         const shiftDist = Math.hypot(box.x - lbl.item.sx, box.y - lbl.item.sy);
         if (shiftDist > lbl.item.r + 22) {
           ctx.save();
@@ -2242,23 +2402,77 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
         drawRoundLabel(lbl.label, box.x, box.y, lbl.stroke, 0.92);
       }
 
-      // Draw beam match_pct% badges clearly without stacking onto node labels
+      // Draw beam match_pct% badges clearly: widen spiral offsets & suppress colliding badges in tight clusters
+      let denseBeams = beamBadges.length >= 5;
+      if (!denseBeams && beamBadges.length >= 3) {
+        let sumDist = 0, pairCount = 0;
+        for (let i = 0; i < beamBadges.length; i++) {
+          for (let j = i + 1; j < beamBadges.length; j++) {
+            sumDist += Math.hypot(beamBadges[i].x - beamBadges[j].x, beamBadges[i].y - beamBadges[j].y);
+            pairCount++;
+          }
+        }
+        if (pairCount > 0 && (sumDist / pairCount) < 88) denseBeams = true;
+      }
+      beamBadges.sort(function(a, b) { return (b.score || 0) - (a.score || 0); });
+      const beamOffsets = denseBeams ? [
+        [0, 0],
+        [0, -24],
+        [0, 24],
+        [38, 0],
+        [-38, 0],
+        [44, -24],
+        [-44, 24],
+        [44, 24],
+        [-44, -24],
+        [72, -18],
+        [-72, 18],
+        [72, 18],
+        [-72, -18],
+        [0, -48],
+        [0, 48],
+        [98, -32],
+        [-98, 32],
+        [98, 32],
+        [-98, -32]
+      ] : [
+        [0, 0], [0, -22], [0, 22], [30, 0], [-30, 0], [34, -22], [-34, 22], [54, 0], [-54, 0]
+      ];
       for (const bb of beamBadges) {
         const bDim = measureRoundLabel(bb.text);
-        const bBox = placeDeoverlappedBox(bb.x, bb.y, bDim.w, bDim.h, placedBoxes, [
-          [0, 0], [0, -22], [0, 22], [30, 0], [-30, 0], [34, -22], [-34, 22]
-        ]);
+        const bBox = placeDeoverlappedBox(
+          bb.x,
+          bb.y,
+          bDim.w,
+          bDim.h,
+          placedBoxes,
+          beamOffsets,
+          { maxHitArea: denseBeams ? 0 : 28 }
+        );
+        if (!bBox) continue;
         drawRoundLabel(bb.text, bBox.x, bBox.y, "rgba(251, 191, 36, 0.75)", 0.92, "#fde68a");
       }
 
-      // Draw centroid cluster badges with clean vertical separation
+      // Draw centroid cluster badges with clean vertical separation and collision suppression when dense
       centroidLabels.sort(function(a, b) { return b.count - a.count; });
       const centroidFont = '600 10px ui-monospace, monospace';
+      const maxCentroidLabels = state.activeFilter ? centroidLabels.length : (activeQuery ? 8 : 12);
+      const strictCentroidDeoverlap = centroidLabels.length > 6 || activeQuery;
+      let centroidsDrawn = 0;
       for (const cl of centroidLabels) {
+        if (centroidsDrawn >= maxCentroidLabels) break;
         const cDim = measureRoundLabel(cl.text, centroidFont);
-        const cBox = placeDeoverlappedBox(cl.x, cl.y, cDim.w, cDim.h, placedBoxes, [
-          [0, 0], [0, -22], [0, 22], [52, 0], [-52, 0], [0, -44], [0, 44]
-        ]);
+        const cBox = placeDeoverlappedBox(
+          cl.x,
+          cl.y,
+          cDim.w,
+          cDim.h,
+          placedBoxes,
+          [[0, 0], [0, -22], [0, 22], [52, 0], [-52, 0], [0, -44], [0, 44]],
+          strictCentroidDeoverlap ? { maxHitArea: 0 } : undefined
+        );
+        if (!cBox) continue;
+        centroidsDrawn++;
         drawRoundLabel(cl.text, cBox.x, cBox.y, null, 0.58, cl.color, centroidFont);
       }
 
@@ -2681,6 +2895,73 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
     }
 
+    function needsNodeHydration(node) {
+      if (!node || !IS_LIVE_API) return false;
+      if (node._hydrating || node._hydrated) return false;
+      return (
+        node.summary === undefined ||
+        !Array.isArray(node.vector_preview) ||
+        node.vector_preview.length === 0
+      );
+    }
+
+    async function hydrateNodeDetails(node) {
+      if (!node || !IS_LIVE_API || node._hydrating) return;
+      node._hydrating = true;
+      node._hydrateError = null;
+      if (state.selectedNodeId === node.id && state.drawerOpen && state.drawerTab === "inspector") {
+        renderNodeInspector();
+      }
+      try {
+        const resp = await fetch("/api/node?id=" + encodeURIComponent(node.id));
+        const payload = await resp.json();
+        if (!resp.ok) {
+          throw new Error(payload && payload.error ? payload.error : ("HTTP " + resp.status));
+        }
+        const detail = (payload && typeof payload.node === "object" && payload.node) ? payload.node : payload;
+        if (detail && typeof detail === "object") {
+          node.summary = detail.summary !== undefined && detail.summary !== null
+            ? String(detail.summary)
+            : String(node.summary || "");
+          if (Array.isArray(detail.top_tokens)) {
+            node.top_tokens = detail.top_tokens.map(String);
+          }
+          if (Array.isArray(detail.vector_preview)) {
+            node.vector_preview = detail.vector_preview.map(Number);
+          }
+          if (detail.concepts && typeof detail.concepts === "object") {
+            node.concepts = detail.concepts;
+          }
+          if (detail.dominant_concept) {
+            node.dominant_concept = stripConceptPrefix(detail.dominant_concept);
+          }
+          if (Array.isArray(detail.knn)) {
+            node.knn = detail.knn;
+          }
+          if (detail.title) {
+            node.title = String(detail.title);
+          }
+          if (detail.last_modified_time) {
+            node.last_modified_time = String(detail.last_modified_time);
+          }
+          if (detail.step_count !== undefined) {
+            node.step_count = Math.max(1, Number(detail.step_count) || node.step_count);
+          }
+        }
+        node._hydrated = true;
+      } catch (err) {
+        node._hydrateError = String(err.message || err);
+        node._hydrated = true;
+        if (node.summary === undefined) node.summary = "";
+      } finally {
+        node._hydrating = false;
+        if (state.selectedNodeId === node.id && state.drawerOpen && state.drawerTab === "inspector") {
+          renderNodeInspector();
+        }
+        state.needsRender = true;
+      }
+    }
+
     function renderNodeInspector() {
       const container = document.getElementById("drawer-content");
       container.replaceChildren();
@@ -2689,6 +2970,17 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       if (!node) {
         container.appendChild(el("div", "summary-card", "Click any node in the 3D space or run a query to inspect its 256-dim semantic vector, k-NN neighbors, and recall command."));
         return;
+      }
+
+      if (needsNodeHydration(node)) {
+        hydrateNodeDetails(node);
+      } else if (!IS_LIVE_API) {
+        if (!Array.isArray(node.top_tokens) || !node.top_tokens.length) {
+          node.top_tokens = tokenizeDomainOffline(node.title + " " + (node.summary || "")).slice(0, 18);
+        }
+        if (!Array.isArray(node.vector_preview) || !node.vector_preview.length) {
+          node.vector_preview = offlineVectorPreview(node.top_tokens);
+        }
       }
 
       if (state.queryResult) {
@@ -2715,6 +3007,18 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       meta.appendChild(el("span", "badge", formatDate(node.last_modified_time)));
       meta.appendChild(el("span", "badge", node.step_count + " steps"));
       container.appendChild(meta);
+
+      if (node._hydrating) {
+        const loadingCard = el("div", "summary-card", "Loading node details & 256D vector fingerprint from /api/node…");
+        loadingCard.style.borderColor = "rgba(34, 211, 238, 0.35)";
+        loadingCard.style.color = "#67e8f9";
+        container.appendChild(loadingCard);
+      } else if (node._hydrateError) {
+        const errCard = el("div", "summary-card", "Could not load full node details: " + node._hydrateError);
+        errCard.style.borderColor = "rgba(251, 113, 133, 0.4)";
+        errCard.style.color = "#fda4af";
+        container.appendChild(errCard);
+      }
 
       // Cluster tags
       const clusterWrap = el("div");
@@ -2763,7 +3067,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       tokLbl.appendChild(el("span", null, "click to probe"));
       tokWrap.appendChild(tokLbl);
       const tokPills = el("div", "pill-wrap");
-      if (node.top_tokens.length) {
+      if (Array.isArray(node.top_tokens) && node.top_tokens.length) {
         node.top_tokens.forEach(function(tok) {
           const pill = el("button", "token-pill", tok);
           pill.type = "button";
@@ -2774,6 +3078,8 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
           });
           tokPills.appendChild(pill);
         });
+      } else if (node._hydrating) {
+        tokPills.appendChild(el("span", "badge", "Loading tokens…"));
       } else {
         tokPills.appendChild(el("span", "badge", "No extracted tokens"));
       }
@@ -3020,10 +3326,17 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       if (!NODE_BY_ID.has(nodeId)) return;
       state.selectedNodeId = nodeId;
       const node = NODE_BY_ID.get(nodeId);
+      if (node._hydrateError && (!Array.isArray(node.vector_preview) || !node.vector_preview.length)) {
+        node._hydrated = false;
+        node._hydrateError = null;
+      }
       focusOnPoint(node.pos);
       if (openInspector) {
         state.drawerTab = "inspector";
         state.drawerOpen = true;
+      }
+      if (needsNodeHydration(node)) {
+        hydrateNodeDetails(node);
       }
       syncDrawerTabs();
       state.needsRender = true;
@@ -3152,17 +3465,45 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
         const k = state.colorBy === "provider" ? n.provider : n.dominant_concept;
         counts.set(k, (counts.get(k) || 0) + 1);
       });
+      if (state.colorBy === "cluster") {
+        CENTROIDS.forEach(function(c) {
+          if (c.concept && !counts.has(c.concept) && c.count > 0) {
+            counts.set(c.concept, c.count);
+          }
+        });
+      }
+      const hasDynamicTopics = Array.from(counts.keys()).some(function(k) {
+        const lower = String(k).toLowerCase();
+        return lower.startsWith("topic:") || !Object.prototype.hasOwnProperty.call(CLUSTER_COLORS, lower);
+      });
       if (state.colorBy === "cluster" && Array.isArray(GRAPH.cluster_names)) {
         GRAPH.cluster_names.forEach(function(cn) {
           const clean = stripConceptPrefix(cn);
-          if (!counts.has(clean)) counts.set(clean, 0);
+          if (!counts.has(clean)) {
+            if (hasDynamicTopics && NODES.length > 0) return;
+            counts.set(clean, 0);
+          }
         });
       }
 
-      const sortedKeys = Array.from(counts.keys()).sort(function(a, b) {
-        const diff = (counts.get(b) || 0) - (counts.get(a) || 0);
-        return diff !== 0 ? diff : a.localeCompare(b);
-      });
+      const sortedKeys = Array.from(counts.keys())
+        .filter(function(k) {
+          const c = counts.get(k) || 0;
+          if (state.activeFilter === k) return true;
+          if (state.colorBy === "cluster" && hasDynamicTopics && c <= 0) return false;
+          return true;
+        })
+        .sort(function(a, b) {
+          const ca = counts.get(a) || 0;
+          const cb = counts.get(b) || 0;
+          const aNonEmpty = ca > 0 ? 1 : 0;
+          const bNonEmpty = cb > 0 ? 1 : 0;
+          if (bNonEmpty !== aNonEmpty) return bNonEmpty - aNonEmpty;
+          if (cb !== ca) return cb - ca;
+          if (a === "general" && b !== "general") return 1;
+          if (b === "general" && a !== "general") return -1;
+          return a.localeCompare(b);
+        });
 
       const clearFilterBtn = document.getElementById("btn-clear-filter");
       clearFilterBtn.style.display = state.activeFilter ? "inline-flex" : "none";

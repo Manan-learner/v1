@@ -20,6 +20,7 @@ from v1_memory.hybrid_rag import (
     cosine_similarity,
     expand_with_concepts,
     group_tokens_by_concept,
+    is_fastembed_active,
     qualifying_shared_concepts,
     reciprocal_rank_fusion,
 )
@@ -35,7 +36,13 @@ from v1_memory.text_utils import (
 DEFAULT_STATE_HOME = Path.home() / ".v1-memory"
 HIGH_DF_SUPPRESSION_RATIO = 0.55
 MIN_CORPUS_FOR_IDF = 5
-DENSE_COSINE_FLOOR = 0.42
+DENSE_COSINE_FLOOR_STDLIB = 0.14
+DENSE_COSINE_FLOOR_FASTEMBED = 0.42
+DENSE_COSINE_FLOOR = DENSE_COSINE_FLOOR_STDLIB
+FTS_PER_TOKEN_LIMIT = 40
+FTS_MAX_CANDIDATES = 200
+SINGLE_TOKEN_IDF_PERCENTILE = 0.85
+SINGLE_TOKEN_MAX_DF_RATIO = 0.15
 
 LAST_REBUILD_STATS: dict[str, int] = {"total": 0, "updated": 0, "skipped": 0}
 LAST_UNINDEXED_CACHE_STATS: dict[str, int] = {"hits": 0, "misses": 0}
@@ -507,6 +514,117 @@ def _parse_json_list(raw: str | None) -> list:
         return []
 
 
+def _filter_non_high_df_fts_terms(
+    conn: sqlite3.Connection,
+    query_terms: Sequence[str] | None,
+    total_count: int,
+    *,
+    is_chunked: bool = False,
+    fts_df_out: dict[str, int] | None = None,
+) -> list[str]:
+    """Filter query terms against FTS5 DF so high-DF boilerplate never starves specific terms."""
+    if not query_terms:
+        return []
+    dedup_terms = list(dict.fromkeys(str(t) for t in query_terms if str(t).strip()))
+    if not dedup_terms:
+        return []
+    if total_count < MIN_CORPUS_FOR_IDF:
+        return dedup_terms
+
+    high_df_cutoff = max(1, math.ceil(total_count * HIGH_DF_SUPPRESSION_RATIO))
+    inner_sql = (
+        "SELECT DISTINCT conversation_id FROM conversations_fts WHERE conversations_fts MATCH ? LIMIT ?"
+        if is_chunked
+        else "SELECT 1 FROM conversations_fts WHERE conversations_fts MATCH ? LIMIT ?"
+    )
+    count_sql = f"SELECT COUNT(*) FROM ({inner_sql})"
+
+    active: list[str] = []
+    for term in dedup_terms:
+        try:
+            cnt = int(conn.execute(count_sql, (f'"{term}"', high_df_cutoff)).fetchone()[0])
+        except sqlite3.Error:
+            cnt = 0
+        if fts_df_out is not None and cnt > 0:
+            fts_df_out[term] = fts_df_out.get(term, 0) + cnt
+        if cnt < high_df_cutoff:
+            active.append(term)
+    return active
+
+
+def _round_robin_dedup_rows(
+    priority_rows: Sequence[sqlite3.Row],
+    per_token_lists: Sequence[Sequence[sqlite3.Row]],
+    extra_rows: Sequence[sqlite3.Row] = (),
+    *,
+    max_cids: int = FTS_MAX_CANDIDATES,
+    exclude_ids: set[str] | None = None,
+) -> tuple[list[sqlite3.Row], set[str]]:
+    """Merge priority, per-token round-robin, and fallback rows deduplicated by conversation_id."""
+    excluded = exclude_ids or set()
+    selected: list[sqlite3.Row] = []
+    seen_cids: set[str] = set()
+
+    def _add_cid_group(rows_for_cid: Sequence[sqlite3.Row]) -> None:
+        selected.extend(rows_for_cid)
+
+    for row in priority_rows:
+        cid = row["conversation_id"]
+        if cid in excluded:
+            continue
+        if cid not in seen_cids:
+            if len(seen_cids) >= max_cids:
+                break
+            seen_cids.add(cid)
+        _add_cid_group((row,))
+
+    if len(seen_cids) < max_cids and per_token_lists:
+        # Group each token's rows by conversation_id preserving BM25 rank order.
+        grouped_lists: list[list[tuple[str, list[sqlite3.Row]]]] = []
+        for tok_rows in per_token_lists:
+            by_cid: dict[str, list[sqlite3.Row]] = {}
+            for row in tok_rows:
+                cid = row["conversation_id"]
+                if cid in excluded:
+                    continue
+                if cid not in by_cid:
+                    if len(by_cid) >= FTS_PER_TOKEN_LIMIT:
+                        continue
+                    by_cid[cid] = []
+                by_cid[cid].append(row)
+            if by_cid:
+                grouped_lists.append(list(by_cid.items()))
+
+        if grouped_lists:
+            max_depth = max(len(lst) for lst in grouped_lists)
+            for idx in range(max_depth):
+                if len(seen_cids) >= max_cids:
+                    break
+                for lst in grouped_lists:
+                    if idx >= len(lst):
+                        continue
+                    cid, cid_rows = lst[idx]
+                    if cid in seen_cids:
+                        continue
+                    seen_cids.add(cid)
+                    _add_cid_group(cid_rows)
+                    if len(seen_cids) >= max_cids:
+                        break
+
+    if len(seen_cids) < max_cids and extra_rows:
+        for row in extra_rows:
+            cid = row["conversation_id"]
+            if cid in excluded:
+                continue
+            if cid not in seen_cids:
+                if len(seen_cids) >= max_cids:
+                    break
+                seen_cids.add(cid)
+            _add_cid_group((row,))
+
+    return selected, seen_cids
+
+
 def _collect_antigravity_candidates(
     agy_db: Path,
     fts_query: str,
@@ -517,6 +635,8 @@ def _collect_antigravity_candidates(
     core_fts_query: str | None = None,
     hybrid_rag: bool = True,
     port_conn: sqlite3.Connection | None = None,
+    query_terms: Sequence[str] | None = None,
+    fts_df_out: dict[str, int] | None = None,
 ) -> tuple[dict[str, dict], int]:
     global LAST_UNINDEXED_CACHE_STATS
     docs: dict[str, dict] = {}
@@ -556,6 +676,17 @@ def _collect_antigravity_candidates(
 
     try:
         conn.row_factory = sqlite3.Row
+        cnt_row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM conversation_summaries
+            WHERE conversation_id != ?
+              AND COALESCE(parent_conversation_id, '') = ''
+            """,
+            (current_conv_id,),
+        ).fetchone()
+        total_count = int(cnt_row[0]) if cnt_row else 0
+
         fts_cols = {row[1] for row in conn.execute("PRAGMA table_info(conversations_fts)").fetchall()}
         u_col = "user_body" if "user_body" in fts_cols else ("user_text" if "user_text" in fts_cols else None)
         a_col = "agent_body" if "agent_body" in fts_cols else ("agent_text" if "agent_text" in fts_cols else None)
@@ -586,39 +717,51 @@ def _collect_antigravity_candidates(
         """
 
         if fts_cols:
-            if core_fts_query and core_fts_query != fts_query:
-                ranked_chunks.extend(conn.execute(base_fts_sql, (core_fts_query, current_conv_id, 120)).fetchall())
-            main_chunks = conn.execute(base_fts_sql, (fts_query, current_conv_id, 350)).fetchall()
-            ranked_chunks.extend(main_chunks)
+            active_terms = _filter_non_high_df_fts_terms(
+                conn,
+                query_terms,
+                total_count,
+                is_chunked=True,
+                fts_df_out=fts_df_out,
+            )
+            priority_chunks: list[sqlite3.Row] = []
+            per_token_chunks: list[list[sqlite3.Row]] = []
 
-            found_cids = {r["conversation_id"] for r in ranked_chunks}
-            if len(main_chunks) >= 350 and len(found_cids) < 80 and found_cids:
-                placeholders = ",".join("?" for _ in found_cids)
-                supp_sql = f"""
-                    SELECT
-                        f.conversation_id,
-                        cs.title,
-                        cs.preview,
-                        cs.last_modified_time,
-                        cs.step_count,
-                        cs.workspace_uris,
-                        {u_expr} AS user_snip,
-                        {a_expr} AS agent_snip,
-                        {t_expr} || ' ' || {u_expr} || ' ' || {a_expr} AS chunk_text
-                    FROM conversations_fts f
-                    JOIN conversation_summaries cs
-                      ON cs.conversation_id = f.conversation_id
-                    WHERE conversations_fts MATCH ?
-                      AND f.conversation_id != ?
-                      AND COALESCE(cs.parent_conversation_id, '') = ''
-                      AND f.conversation_id NOT IN ({placeholders})
-                    ORDER BY bm25(conversations_fts) ASC
-                    LIMIT 250
-                """
-                ranked_chunks.extend(
-                    conn.execute(supp_sql, [fts_query, current_conv_id, *found_cids]).fetchall()
+            if active_terms:
+                if len(active_terms) >= 2:
+                    if len(active_terms) <= 4:
+                        phrase_q = f'"{" ".join(active_terms)}"'
+                        priority_chunks.extend(
+                            conn.execute(base_fts_sql, (phrase_q, current_conv_id, 40)).fetchall()
+                        )
+                    and_q = " AND ".join(f'"{t}"' for t in active_terms[:6])
+                    priority_chunks.extend(
+                        conn.execute(base_fts_sql, (and_q, current_conv_id, FTS_PER_TOKEN_LIMIT * 2)).fetchall()
+                    )
+                    or_q = " OR ".join(f'"{t}"' for t in active_terms)
+                    priority_chunks.extend(
+                        conn.execute(base_fts_sql, (or_q, current_conv_id, FTS_PER_TOKEN_LIMIT * 2)).fetchall()
+                    )
+                for term in active_terms:
+                    per_token_chunks.append(
+                        conn.execute(base_fts_sql, (f'"{term}"', current_conv_id, FTS_PER_TOKEN_LIMIT * 2)).fetchall()
+                    )
+            elif core_fts_query and core_fts_query != fts_query:
+                priority_chunks.extend(
+                    conn.execute(base_fts_sql, (core_fts_query, current_conv_id, 120)).fetchall()
                 )
-                found_cids = {r["conversation_id"] for r in ranked_chunks}
+
+            extra_chunks: list[sqlite3.Row] = []
+            if hybrid_rag or not active_terms:
+                extra_chunks = conn.execute(base_fts_sql, (fts_query, current_conv_id, 250)).fetchall()
+
+            ranked_chunks, found_cids = _round_robin_dedup_rows(
+                priority_chunks,
+                per_token_chunks,
+                extra_chunks,
+                max_cids=FTS_MAX_CANDIDATES,
+                exclude_ids=exclude_ids,
+            )
 
             if hybrid_rag and len(found_cids) < 25:
                 recent_indexed_fallback = conn.execute(
@@ -656,17 +799,6 @@ def _collect_antigravity_candidates(
             """,
             (current_conv_id,),
         ).fetchall()
-
-        cnt_row = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM conversation_summaries
-            WHERE conversation_id != ?
-              AND COALESCE(parent_conversation_id, '') = ''
-            """,
-            (current_conv_id,),
-        ).fetchone()
-        total_count = int(cnt_row[0]) if cnt_row else 0
     except sqlite3.Error:
         return docs, 0
     finally:
@@ -852,6 +984,10 @@ def _collect_portable_candidates(
     provider_filter: str | None = None,
     include_dense_scan: bool = True,
     port_conn: sqlite3.Connection | None = None,
+    query_terms: Sequence[str] | None = None,
+    core_fts_query: str | None = None,
+    hybrid_rag: bool = True,
+    fts_df_out: dict[str, int] | None = None,
 ) -> tuple[dict[str, dict], int]:
     docs: dict[str, dict] = {}
     if not index_db.exists() and port_conn is None:
@@ -893,12 +1029,13 @@ def _collect_portable_candidates(
             base_params,
         ).fetchone()
         total_count = int(cnt_row[0]) if cnt_row else 0
+        if provider_filter and provider_filter not in ("auto", "all"):
+            all_cnt_row = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()
+            total_fts_docs = int(all_cnt_row[0]) if all_cnt_row else total_count
+        else:
+            total_fts_docs = total_count
 
-        where = ["conversations_fts MATCH ?"] + base_where
-        params: list = [fts_query] + base_params
-
-        rows = conn.execute(
-            f"""
+        fts_select = f"""
             SELECT
                 c.conversation_id,
                 c.provider,
@@ -913,12 +1050,56 @@ def _collect_portable_candidates(
             FROM conversations_fts f
             JOIN conversations c
               ON c.conversation_id = f.conversation_id
-            WHERE {' AND '.join(where)}
+            WHERE conversations_fts MATCH ? AND {' AND '.join(base_where)}
             ORDER BY bm25(conversations_fts) ASC
-            LIMIT 100
-            """,
-            params,
-        ).fetchall()
+            LIMIT ?
+        """
+
+        active_terms = _filter_non_high_df_fts_terms(
+            conn,
+            query_terms,
+            total_fts_docs,
+            is_chunked=False,
+            fts_df_out=fts_df_out,
+        )
+        priority_rows: list[sqlite3.Row] = []
+        per_token_rows: list[list[sqlite3.Row]] = []
+
+        if active_terms:
+            if len(active_terms) >= 2:
+                if len(active_terms) <= 4:
+                    phrase_q = f'"{" ".join(active_terms)}"'
+                    priority_rows.extend(
+                        conn.execute(fts_select, [phrase_q] + base_params + [20]).fetchall()
+                    )
+                and_q = " AND ".join(f'"{t}"' for t in active_terms[:6])
+                priority_rows.extend(
+                    conn.execute(fts_select, [and_q] + base_params + [FTS_PER_TOKEN_LIMIT]).fetchall()
+                )
+                or_q = " OR ".join(f'"{t}"' for t in active_terms)
+                priority_rows.extend(
+                    conn.execute(fts_select, [or_q] + base_params + [FTS_PER_TOKEN_LIMIT]).fetchall()
+                )
+            for term in active_terms:
+                per_token_rows.append(
+                    conn.execute(fts_select, [f'"{term}"'] + base_params + [FTS_PER_TOKEN_LIMIT]).fetchall()
+                )
+        elif core_fts_query and core_fts_query != fts_query:
+            priority_rows.extend(
+                conn.execute(fts_select, [core_fts_query] + base_params + [FTS_PER_TOKEN_LIMIT]).fetchall()
+            )
+
+        extra_rows: list[sqlite3.Row] = []
+        if hybrid_rag or not active_terms:
+            extra_rows = conn.execute(fts_select, [fts_query] + base_params + [120]).fetchall()
+
+        rows, _ = _round_robin_dedup_rows(
+            priority_rows,
+            per_token_rows,
+            extra_rows,
+            max_cids=FTS_MAX_CANDIDATES,
+            exclude_ids=exclude_ids,
+        )
 
         if include_dense_scan:
             dense_rows = conn.execute(
@@ -1147,6 +1328,7 @@ def find_context_matches(
 
     docs_by_id: dict[str, dict] = {}
     total_db_parent_count = 0
+    fts_df_counts: dict[str, int] = {}
     try:
         if provider_filter in ("all", "auto", "antigravity"):
             agy_docs, agy_count = _collect_antigravity_candidates(
@@ -1159,6 +1341,8 @@ def find_context_matches(
                 core_fts_query=core_fts_query,
                 hybrid_rag=hybrid_rag,
                 port_conn=port_conn,
+                query_terms=core_raw_terms,
+                fts_df_out=fts_df_counts,
             )
             docs_by_id.update(agy_docs)
             total_db_parent_count += agy_count
@@ -1171,6 +1355,10 @@ def find_context_matches(
                 provider_filter=provider_filter,
                 include_dense_scan=hybrid_rag,
                 port_conn=port_conn,
+                query_terms=core_raw_terms,
+                core_fts_query=core_fts_query,
+                hybrid_rag=hybrid_rag,
+                fts_df_out=fts_df_counts,
             )
             docs_by_id.update(port_docs)
             total_db_parent_count += port_count
@@ -1205,14 +1393,43 @@ def find_context_matches(
         return q_tokens, []
 
     n_corpus, df, high_df_tokens = _compute_corpus_stats(doc_tokens_by_cid, total_db_parent_count)
+    eff_df = dict(df)
+    if n_corpus >= 50 and fts_df_counts and provider_filter in ("all", "auto"):
+        high_df_cutoff = max(1, math.ceil(n_corpus * HIGH_DF_SUPPRESSION_RATIO))
+        for qt in q_tokens:
+            if qt in fts_df_counts:
+                exact_db_df = min(n_corpus, int(fts_df_counts[qt]))
+                if exact_db_df >= high_df_cutoff:
+                    high_df_tokens.add(qt)
+                elif exact_db_df > 0 and qt not in high_df_tokens:
+                    eff_df[qt] = exact_db_df
+
     q_active = [t for t in q_tokens if t not in high_df_tokens]
     q_active_set = set(q_active)
     if len(q_active_set) < min_matched_tokens:
         return q_tokens, []
 
-    q_idf_sum = sum(_bm25_idf(t, n_corpus, df, high_df_tokens) for t in q_active_set)
+    non_hdf_idfs = sorted(
+        _bm25_idf(tok, n_corpus, eff_df, high_df_tokens)
+        for tok in eff_df
+        if tok not in high_df_tokens
+    )
+    p85_idf = (
+        non_hdf_idfs[min(len(non_hdf_idfs) - 1, int(SINGLE_TOKEN_IDF_PERCENTILE * len(non_hdf_idfs)))]
+        if non_hdf_idfs
+        else 0.0
+    )
+
+    q_idf_sum = sum(_bm25_idf(t, n_corpus, eff_df, high_df_tokens) for t in q_active_set)
     q_concept_hits = group_tokens_by_concept(q_active, syns) if hybrid_rag else {}
-    q_vec = compute_semantic_vector(q_active, custom_synonyms=syns) if hybrid_rag else []
+    q_idf_weights = (
+        {t: _bm25_idf(t, n_corpus, eff_df, high_df_tokens) for t in q_active_set}
+        if (hybrid_rag and n_corpus >= MIN_CORPUS_FOR_IDF)
+        else None
+    )
+    q_vec = compute_semantic_vector(q_active, custom_synonyms=syns, idf_weights=q_idf_weights) if hybrid_rag else []
+    use_fastembed = bool(hybrid_rag and is_fastembed_active())
+    dense_floor = DENSE_COSINE_FLOOR_FASTEMBED if use_fastembed else DENSE_COSINE_FLOOR_STDLIB
 
     w_sem = max(0.0, min(1.0, float(semantic_weight)))
     w_con = 1.0 - w_sem
@@ -1232,9 +1449,9 @@ def find_context_matches(
         title_stems = {stem_token(t) for t in title_active}
         title_hits = sum(1 for qt in q_active_set if qt in title_active or stem_token(qt) in title_stems)
 
-        doc_idf_sum = sum(_bm25_idf(t, n_corpus, df, high_df_tokens) for t in doc_active)
+        doc_idf_sum = sum(_bm25_idf(t, n_corpus, eff_df, high_df_tokens) for t in doc_active)
         denom_weight = max(0.75 * q_idf_sum, min(q_idf_sum, doc_idf_sum))
-        exact_weight = sum(_bm25_idf(t, n_corpus, df, high_df_tokens) for t in exact_matched)
+        exact_weight = sum(_bm25_idf(t, n_corpus, eff_df, high_df_tokens) for t in exact_matched)
         exact_pct = round(min(100.0, (exact_weight / denom_weight) * 100.0), 1) if denom_weight > 1e-9 else 0.0
 
         cos_sim = 0.0
@@ -1277,26 +1494,67 @@ def find_context_matches(
             concept_doc_hits = sorted(doc_hit_pool)
 
         dense_fallback = bool(
-            hybrid_rag and len(q_active_set) >= min_matched_tokens and cos_sim >= DENSE_COSINE_FLOOR
+            hybrid_rag and len(q_active_set) >= min_matched_tokens and cos_sim >= dense_floor
         )
-        if len(covered_q_tokens) < min_matched_tokens and not dense_fallback:
+        single_token_rescue = False
+        single_df_ratio = 1.0
+        candidate_single_tok: str | None = None
+        if len(covered_q_tokens) == 1:
+            candidate_single_tok = next(iter(covered_q_tokens))
+        elif not covered_q_tokens and len(stem_matched_q) == 1:
+            candidate_single_tok = stem_matched_q[0]
+
+        if (
+            candidate_single_tok is not None
+            and hybrid_rag
+            and n_corpus >= MIN_CORPUS_FOR_IDF
+            and cos_sim >= dense_floor
+        ):
+            single_idf = _bm25_idf(candidate_single_tok, n_corpus, eff_df, high_df_tokens)
+            single_df_ratio = eff_df.get(candidate_single_tok, 1) / max(1, n_corpus)
+            if single_idf > 0.0 and single_idf >= p85_idf and single_df_ratio <= SINGLE_TOKEN_MAX_DF_RATIO:
+                single_token_rescue = True
+                covered_q_tokens.add(candidate_single_tok)
+
+        if len(covered_q_tokens) < min_matched_tokens and not dense_fallback and not single_token_rescue:
             continue
 
-        covered_weight = sum(_bm25_idf(t, n_corpus, df, high_df_tokens) for t in covered_q_tokens)
+        covered_weight = sum(_bm25_idf(t, n_corpus, eff_df, high_df_tokens) for t in covered_q_tokens)
         concept_coverage_pct = (
             round(min(100.0, (covered_weight / denom_weight) * 100.0), 1) if denom_weight > 1e-9 else 0.0
         )
 
         has_extra_stem_coverage = len(stem_matched_q) > len(exact_matched) and len(stem_matched_q) >= min_matched_tokens
-        if hybrid_rag and (qualifying_concepts or has_extra_stem_coverage):
-            concept_and_cosine_pct = round(min(100.0, w_con * concept_coverage_pct + w_sem * (cos_sim * 100.0)), 1)
-            hybrid_pct = round(max(exact_pct, concept_and_cosine_pct), 1)
-        elif dense_fallback and len(exact_matched) < min_matched_tokens:
+        if len(covered_q_tokens) >= min_matched_tokens:
+            if hybrid_rag and (qualifying_concepts or has_extra_stem_coverage):
+                blended_pct = w_con * concept_coverage_pct + w_sem * (cos_sim * 100.0)
+                if has_extra_stem_coverage and not use_fastembed and cos_sim >= dense_floor:
+                    blended_pct = max(blended_pct, 0.9 * concept_coverage_pct)
+                concept_and_cosine_pct = round(min(100.0, blended_pct), 1)
+                hybrid_pct = round(max(exact_pct, concept_and_cosine_pct), 1)
+            elif dense_fallback and len(exact_matched) < min_matched_tokens:
+                concept_and_cosine_pct = round(
+                    min(100.0, max(w_con * concept_coverage_pct + w_sem * (cos_sim * 100.0), cos_sim * 100.0)),
+                    1,
+                )
+                hybrid_pct = round(max(exact_pct, concept_and_cosine_pct), 1)
+            else:
+                concept_and_cosine_pct = 0.0
+                hybrid_pct = exact_pct
+        elif single_token_rescue:
+            idf_share = min(1.0, covered_weight / denom_weight) if denom_weight > 1e-9 else 0.0
+            cos_norm = cos_sim if use_fastembed else min(1.0, cos_sim / 0.28)
+            rarity_strength = max(0.0, min(1.0, 1.0 - (single_df_ratio / SINGLE_TOKEN_MAX_DF_RATIO)))
+            raw_rescue_pct = 100.0 * (0.40 * idf_share + 0.40 * cos_norm + 0.20 * rarity_strength)
+            dampen = min(0.82, 0.56 + 0.36 * idf_share)
             concept_and_cosine_pct = round(
-                min(100.0, max(w_con * concept_coverage_pct + w_sem * (cos_sim * 100.0), cos_sim * 100.0)),
+                min(62.0, raw_rescue_pct * dampen + (4.0 if title_hits > 0 else 0.0)),
                 1,
             )
-            hybrid_pct = round(max(exact_pct, concept_and_cosine_pct), 1)
+            hybrid_pct = concept_and_cosine_pct
+        elif dense_fallback:
+            concept_and_cosine_pct = round(min(100.0, cos_sim * 100.0), 1)
+            hybrid_pct = concept_and_cosine_pct
         else:
             concept_and_cosine_pct = 0.0
             hybrid_pct = exact_pct
@@ -1308,9 +1566,14 @@ def find_context_matches(
         if hybrid_rag and (
             qualifying_concepts
             or has_extra_stem_coverage
+            or single_token_rescue
             or (dense_fallback and len(exact_matched) < min_matched_tokens)
         ):
-            if len(exact_matched) < len(q_active_set) or concept_and_cosine_pct >= exact_pct:
+            if (
+                len(exact_matched) < len(q_active_set)
+                or concept_and_cosine_pct >= exact_pct
+                or single_token_rescue
+            ):
                 for sc in qualifying_concepts:
                     if sc not in matched_out:
                         matched_out.append(sc)

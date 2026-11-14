@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import heapq
+import inspect
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from operator import mul
 from pathlib import Path
 from typing import Any, Sequence
+from urllib.parse import parse_qs, urlsplit
 
 from v1_memory.context_finder import load_config
 from v1_memory.hybrid_rag import (
@@ -73,8 +78,22 @@ def compute_vector_preview(vec: Sequence[float], buckets: int = VECTOR_PREVIEW_B
     if not vec or buckets <= 0:
         return [0.0] * max(0, buckets)
     n = len(vec)
+    if n == buckets * 4:
+        preview: list[float] = []
+        for idx in range(0, n, 4):
+            c0 = float(vec[idx])
+            c1 = float(vec[idx + 1])
+            c2 = float(vec[idx + 2])
+            c3 = float(vec[idx + 3])
+            rms = math.sqrt((c0 * c0 + c1 * c1 + c2 * c2 + c3 * c3) * 0.25)
+            if rms <= 1e-12:
+                preview.append(0.0)
+            else:
+                sign = 1.0 if (c0 + c1 + c2 + c3) >= 0.0 else -1.0
+                preview.append(round(sign * rms, 4))
+        return preview
     step = max(1, n // buckets)
-    preview: list[float] = []
+    preview = []
     for b in range(buckets):
         start = b * step
         end = n if b == buckets - 1 else min(n, (b + 1) * step)
@@ -89,12 +108,26 @@ def compute_vector_preview(vec: Sequence[float], buckets: int = VECTOR_PREVIEW_B
     return preview
 
 
+_SUMPROD = getattr(math, "sumprod", None)
+
+
 def _dot(a: Sequence[float], b: Sequence[float]) -> float:
-    return sum(float(x) * float(y) for x, y in zip(a, b))
+    if _SUMPROD is not None:
+        return float(_SUMPROD(a, b))
+    return float(sum(map(mul, a, b)))
 
 
 def _vec_norm(v: Sequence[float]) -> float:
-    return math.sqrt(sum(float(x) * float(x) for x in v))
+    return math.sqrt(_dot(v, v))
+
+
+def _to_unit_tuple(v: Sequence[float]) -> tuple[float, ...]:
+    vals = [float(x) for x in v]
+    norm = math.sqrt(_dot(vals, vals))
+    if norm <= 1e-12:
+        return tuple(vals)
+    inv = 1.0 / norm
+    return tuple(x * inv for x in vals)
 
 
 def _orthogonalize_unit(vec: list[float], basis: Sequence[Sequence[float]]) -> list[float]:
@@ -138,18 +171,19 @@ def project_vector_3d(
     coords: list[float] = []
     for k in range(3):
         if k < len(basis) and len(basis[k]) >= dim:
-            coords.append(round(sum(centered[j] * float(basis[k][j]) for j in range(dim)), 4))
+            b_k = basis[k][:dim] if len(basis[k]) > dim else basis[k]
+            coords.append(round(_dot(centered, b_k), 4))
         else:
             coords.append(0.0)
     return coords
 
 
-def fit_pca_3d(vectors: Sequence[Sequence[float]], max_iter: int = 35) -> PCAResult:
-    """Fit a deterministic 3D PCA model using deflated Power Iteration in pure Python stdlib.
+def fit_pca_3d(vectors: Sequence[Sequence[float]], max_iter: int = 45) -> PCAResult:
+    """Fit a deterministic SNR-conditioned 3D PCA model using deflated Power Iteration in pure Python stdlib.
 
-    Handles `N == 0`, `N == 1`, `N == 2`, and zero-variance matrices cleanly without `ZeroDivisionError`.
-    Normalizes projected 3D coordinates into a `[-1.0, 1.0]` bounding sphere while baking the uniform scale
-    into `basis` so `project_vector_3d(vec, mean, basis)` maps into the exact same normalized 3D frame.
+    Applies anisotropic signal-to-noise variance conditioning (`w_vec`) before covariance/eigenvector extraction,
+    and folds `w_vec[j] / scale` into `basis` so `project_vector_3d(vec, mean, basis)` maps queries directly
+    into the exact conditioned `[-1.0, 1.0]` bounding sphere with zero signature changes.
     """
     n_docs = len(vectors)
     dim = len(vectors[0]) if n_docs > 0 and vectors[0] else VECTOR_DIM
@@ -183,17 +217,39 @@ def fit_pca_3d(vectors: Sequence[Sequence[float]], max_iter: int = 35) -> PCARes
         )
 
     mean_vec = [0.0] * dim
+    sum_sq = [0.0] * dim
     for v in vectors:
         for j in range(min(dim, len(v))):
-            mean_vec[j] += float(v[j])
-    mean_vec = [x / n_docs for x in mean_vec]
+            val = float(v[j])
+            mean_vec[j] += val
+            sum_sq[j] += val * val
+    inv_n = 1.0 / n_docs
+    mean_vec = [x * inv_n for x in mean_vec]
+    var_vec = [max(0.0, (sum_sq[j] * inv_n) - (mean_vec[j] * mean_vec[j])) for j in range(dim)]
+    total_raw_var = sum(var_vec) * n_docs
 
-    centered: list[list[float]] = []
-    total_var = 0.0
-    for v in vectors:
-        row = [(float(v[j]) if j < len(v) else 0.0) - mean_vec[j] for j in range(dim)]
-        total_var += sum(x * x for x in row)
-        centered.append(row)
+    if total_raw_var <= 1e-12:
+        zero_coords = [[0.0, 0.0, 0.0] for _ in range(n_docs)]
+        rounded_mean = [round(x, 6) for x in mean_vec]
+        return PCAResult(
+            coords=zero_coords,
+            positions=zero_coords,
+            mean=rounded_mean,
+            mean_vec=rounded_mean,
+            basis=default_basis,
+            unit_basis=default_basis,
+            scale=1.0,
+            variance_explained=[0.0, 0.0, 0.0],
+        )
+
+    sorted_vars = sorted(var_vec)
+    noise_floor = sorted_vars[int(0.60 * dim)] * 0.95 if n_docs >= 12 else 0.0
+    w_vec = [((v - noise_floor) ** 0.75) if v > noise_floor else 0.0 for v in var_vec]
+    if sum(w_vec) <= 1e-12:
+        w_vec = [1.0 if v > 1e-12 else 0.0 for v in var_vec]
+
+    sp = _SUMPROD if _SUMPROD is not None else _dot
+    total_var = n_docs * sum(var_vec[j] * w_vec[j] * w_vec[j] for j in range(dim))
 
     if total_var <= 1e-12:
         zero_coords = [[0.0, 0.0, 0.0] for _ in range(n_docs)]
@@ -209,88 +265,165 @@ def fit_pca_3d(vectors: Sequence[Sequence[float]], max_iter: int = 35) -> PCARes
             variance_explained=[0.0, 0.0, 0.0],
         )
 
-    work = [list(row) for row in centered]
+    def _whiten_row(v: Sequence[float]) -> tuple[float, ...]:
+        if len(v) >= dim:
+            return tuple((float(v[j]) - mean_vec[j]) * w_vec[j] for j in range(dim))
+        return tuple(((float(v[j]) if j < len(v) else 0.0) - mean_vec[j]) * w_vec[j] for j in range(dim))
+
     unit_basis: list[list[float]] = []
-    eigenvalues: list[float] = []
 
-    for comp_idx in range(3):
-        # Deterministic seed selection: start with unit vector e_{comp_idx}, falling back to the
-        # coordinate axis or deflated row with maximal projection energy if e_{comp_idx} is orthogonal.
-        seed = [1.0 if j == comp_idx else 0.0 for j in range(dim)]
-        w = _orthogonalize_unit(seed, unit_basis)
-        z_probe = [_dot(row, w) for row in work] if any(w) else []
-        if not z_probe or sum(val * val for val in z_probe) <= 1e-12:
-            best_axis = -1
-            best_energy = 0.0
-            for j in range(dim):
-                col_energy = sum(work[i][j] * work[i][j] for i in range(n_docs))
-                if col_energy > best_energy + 1e-12:
-                    cand = [1.0 if idx == j else 0.0 for idx in range(dim)]
-                    cand_u = _orthogonalize_unit(cand, unit_basis)
-                    if any(cand_u):
-                        e_val = sum(_dot(row, cand_u) ** 2 for row in work)
-                        if e_val > best_energy:
-                            best_energy = e_val
-                            best_axis = j
-            if best_axis >= 0:
-                w = _orthogonalize_unit([1.0 if idx == best_axis else 0.0 for idx in range(dim)], unit_basis)
-            else:
-                w = _fallback_orthogonal_unit(dim, unit_basis)
-                unit_basis.append(w)
-                eigenvalues.append(0.0)
-                continue
-
-        for _ in range(max_iter):
-            z = [_dot(row, w) for row in work]
-            z_energy = sum(val * val for val in z)
-            if z_energy <= 1e-14:
-                break
-            w_next = [0.0] * dim
-            for i, z_i in enumerate(z):
-                if abs(z_i) > 1e-15:
-                    row_i = work[i]
-                    for j in range(dim):
-                        w_next[j] += row_i[j] * z_i
-            w_next = _orthogonalize_unit(w_next, unit_basis)
-            if not any(w_next):
-                break
-            diff_sq = sum((w_next[j] - w[j]) ** 2 for j in range(dim))
-            w = w_next
-            if diff_sq <= 1e-13:
-                break
-
-        w = _orthogonalize_unit(w, unit_basis)
-        if not any(w):
-            w = _fallback_orthogonal_unit(dim, unit_basis)
-            eig_val = 0.0
+    if n_docs > dim:
+        # Fast exact/strided D x D symmetric covariance path when N > D
+        if n_docs > 700:
+            step_cov = n_docs / 700.0
+            sample_rows = [_whiten_row(vectors[int(k * step_cov)]) for k in range(700)]
         else:
-            z_final = [_dot(row, w) for row in work]
-            eig_val = sum(val * val for val in z_final)
-            if eig_val > 1e-12:
-                for i, p_i in enumerate(z_final):
-                    if abs(p_i) > 1e-15:
-                        work[i] = [work[i][j] - p_i * w[j] for j in range(dim)]
+            sample_rows = [_whiten_row(v) for v in vectors]
+        n_cov = len(sample_rows)
+        cols = [tuple(sample_rows[i][j] for i in range(n_cov)) for j in range(dim)]
+        cov = [[0.0] * dim for _ in range(dim)]
+        for a in range(dim):
+            ca = cols[a]
+            cov[a][a] = float(sp(ca, ca))
+            row_a = cov[a]
+            for b in range(a + 1, dim):
+                cab = float(sp(ca, cols[b]))
+                row_a[b] = cab
+                cov[b][a] = cab
+
+        for comp_idx in range(3):
+            seed = [1.0 if j == comp_idx else 0.0 for j in range(dim)]
+            w = _orthogonalize_unit(seed, unit_basis)
+            if not any(w) or sum(cov[j][j] * abs(w[j]) for j in range(dim)) <= 1e-12:
+                best_axis = max(range(dim), key=lambda j: cov[j][j])
+                w = _orthogonalize_unit([1.0 if idx == best_axis else 0.0 for idx in range(dim)], unit_basis)
+                if not any(w):
+                    w = _fallback_orthogonal_unit(dim, unit_basis)
+                    unit_basis.append(w)
+                    continue
+
+            for _ in range(max_iter):
+                w_next = [float(sp(cov[r], w)) for r in range(dim)]
+                w_next = _orthogonalize_unit(w_next, unit_basis)
+                if not any(w_next):
+                    break
+                diff_sq = sum((w_next[j] - w[j]) ** 2 for j in range(dim))
+                w = w_next
+                if diff_sq <= 1e-12:
+                    break
+
+            w = _orthogonalize_unit(w, unit_basis)
+            if not any(w):
+                w = _fallback_orthogonal_unit(dim, unit_basis)
             else:
-                eig_val = 0.0
+                cw = [float(sp(cov[r], w)) for r in range(dim)]
+                eig_val = max(0.0, float(sp(w, cw)))
+                if eig_val > 1e-12:
+                    for a in range(dim):
+                        ev_wa = eig_val * w[a]
+                        row_a = cov[a]
+                        for b in range(a, dim):
+                            val = row_a[b] - ev_wa * w[b]
+                            row_a[b] = val
+                            cov[b][a] = val
+            unit_basis.append(w)
+    else:
+        work = [list(_whiten_row(v)) for v in vectors]
+        for comp_idx in range(3):
+            # Deterministic seed selection: start with unit vector e_{comp_idx}, falling back to the
+            # coordinate axis or deflated row with maximal projection energy if e_{comp_idx} is orthogonal.
+            seed = [1.0 if j == comp_idx else 0.0 for j in range(dim)]
+            w = _orthogonalize_unit(seed, unit_basis)
+            z_probe = [_dot(row, w) for row in work] if any(w) else []
+            if not z_probe or sum(val * val for val in z_probe) <= 1e-12:
+                best_axis = -1
+                best_energy = 0.0
+                for j in range(dim):
+                    col_energy = sum(work[i][j] * work[i][j] for i in range(n_docs))
+                    if col_energy > best_energy + 1e-12:
+                        cand = [1.0 if idx == j else 0.0 for idx in range(dim)]
+                        cand_u = _orthogonalize_unit(cand, unit_basis)
+                        if any(cand_u):
+                            e_val = sum(_dot(row, cand_u) ** 2 for row in work)
+                            if e_val > best_energy:
+                                best_energy = e_val
+                                best_axis = j
+                if best_axis >= 0:
+                    w = _orthogonalize_unit([1.0 if idx == best_axis else 0.0 for idx in range(dim)], unit_basis)
+                else:
+                    w = _fallback_orthogonal_unit(dim, unit_basis)
+                    unit_basis.append(w)
+                    continue
 
-        unit_basis.append(w)
-        eigenvalues.append(eig_val)
+            for _ in range(max_iter):
+                z = [_dot(row, w) for row in work]
+                z_energy = sum(val * val for val in z)
+                if z_energy <= 1e-14:
+                    break
+                w_next = [0.0] * dim
+                for i, z_i in enumerate(z):
+                    if abs(z_i) > 1e-15:
+                        row_i = work[i]
+                        for j in range(dim):
+                            w_next[j] += row_i[j] * z_i
+                w_next = _orthogonalize_unit(w_next, unit_basis)
+                if not any(w_next):
+                    break
+                diff_sq = sum((w_next[j] - w[j]) ** 2 for j in range(dim))
+                w = w_next
+                if diff_sq <= 1e-13:
+                    break
 
-    raw_coords: list[list[float]] = []
-    max_radius = 0.0
-    for row in centered:
-        px = _dot(row, unit_basis[0])
-        py = _dot(row, unit_basis[1])
-        pz = _dot(row, unit_basis[2])
-        r = math.sqrt(px * px + py * py + pz * pz)
-        if r > max_radius:
-            max_radius = r
-        raw_coords.append([px, py, pz])
+            w = _orthogonalize_unit(w, unit_basis)
+            if not any(w):
+                w = _fallback_orthogonal_unit(dim, unit_basis)
+            else:
+                z_final = [_dot(row, w) for row in work]
+                eig_val = sum(val * val for val in z_final)
+                if eig_val > 1e-12:
+                    for i, p_i in enumerate(z_final):
+                        if abs(p_i) > 1e-15:
+                            work[i] = [work[i][j] - p_i * w[j] for j in range(dim)]
 
+            unit_basis.append(w)
+
+    rb0 = tuple(unit_basis[0][j] * w_vec[j] for j in range(dim))
+    rb1 = tuple(unit_basis[1][j] * w_vec[j] for j in range(dim))
+    rb2 = tuple(unit_basis[2][j] * w_vec[j] for j in range(dim))
+    off_r0 = float(sp(mean_vec, rb0))
+    off_r1 = float(sp(mean_vec, rb1))
+    off_r2 = float(sp(mean_vec, rb2))
+    ev0 = 0.0
+    ev1 = 0.0
+    ev2 = 0.0
+    max_r2 = 0.0
+    for v in vectors:
+        vv = v if len(v) == dim else [float(v[j]) if j < len(v) else 0.0 for j in range(dim)]
+        px = float(sp(vv, rb0)) - off_r0
+        py = float(sp(vv, rb1)) - off_r1
+        pz = float(sp(vv, rb2)) - off_r2
+        ev0 += px * px
+        ev1 += py * py
+        ev2 += pz * pz
+        r2 = px * px + py * py + pz * pz
+        if r2 > max_r2:
+            max_r2 = r2
+
+    eigenvalues = [ev0, ev1, ev2]
+    max_radius = math.sqrt(max_r2)
     scale = max_radius if max_radius > 1e-9 else 1.0
-    scaled_basis = [[round(b[j] / scale, 6) for j in range(dim)] for b in unit_basis]
+    scaled_basis = [[round((b[j] * w_vec[j]) / scale, 8) for j in range(dim)] for b in unit_basis]
     rounded_mean = [round(x, 6) for x in mean_vec]
-    coords_3d = [project_vector_3d(v, rounded_mean, scaled_basis) for v in vectors]
+    b0, b1, b2 = tuple(scaled_basis[0]), tuple(scaled_basis[1]), tuple(scaled_basis[2])
+    off0 = float(sp(rounded_mean, b0))
+    off1 = float(sp(rounded_mean, b1))
+    off2 = float(sp(rounded_mean, b2))
+    coords_3d: list[list[float]] = []
+    for v in vectors:
+        if len(v) == dim:
+            coords_3d.append([round(float(sp(v, b0)) - off0, 4), round(float(sp(v, b1)) - off1, 4), round(float(sp(v, b2)) - off2, 4)])
+        else:
+            coords_3d.append(project_vector_3d(v, rounded_mean, scaled_basis))
 
     var_explained = [round(min(100.0, max(0.0, (ev / total_var) * 100.0)), 2) for ev in eigenvalues]
 
@@ -309,18 +442,48 @@ def fit_pca_3d(vectors: Sequence[Sequence[float]], max_iter: int = 35) -> PCARes
 def _select_dominant_concept(
     doc_tokens: Sequence[str],
     custom_synonyms: dict[str, list[str]] | None = None,
+    term_to_concepts: dict[str, set[str]] | None = None,
+    stem_cache: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, list[str]]]:
     """Return `(dominant_concept, concepts_dict)` where `dominant_concept` requires >= 2 distinct stems."""
-    raw_grouped = group_tokens_by_concept(doc_tokens, custom_synonyms)
+    if term_to_concepts is None:
+        _, term_to_concepts = build_concept_lookup(custom_synonyms)
+
+    raw_grouped: dict[str, list[str]] = {}
+    stems_per_cid: dict[str, set[str]] = {}
+    seen_toks: set[str] = set()
+    for raw in doc_tokens:
+        tok = str(raw).lower().strip()
+        if not tok or tok in seen_toks:
+            continue
+        seen_toks.add(tok)
+        if stem_cache is not None:
+            st = stem_cache.get(tok)
+            if st is None:
+                st = stem_token(tok)
+                stem_cache[tok] = st
+        else:
+            st = stem_token(tok)
+        cids = term_to_concepts.get(tok)
+        stem_cids = term_to_concepts.get(st)
+        if cids and stem_cids:
+            merged_cids = cids | stem_cids
+        else:
+            merged_cids = cids or stem_cids
+        if not merged_cids:
+            continue
+        for cid in merged_cids:
+            raw_grouped.setdefault(cid, []).append(tok)
+            stems_per_cid.setdefault(cid, set()).add(st)
+
     concepts_clean: dict[str, list[str]] = {}
     best_cid = "general"
     best_score: tuple[int, int, str] = (0, 0, "")
 
-    for raw_key, hits in raw_grouped.items():
-        cid = raw_key.split(":", 1)[1] if ":" in raw_key else raw_key
-        sorted_hits = sorted(dict.fromkeys(hits))
+    for cid in sorted(raw_grouped):
+        sorted_hits = sorted(raw_grouped[cid])
         concepts_clean[cid] = sorted_hits[:12]
-        n_stems = len({stem_token(t) for t in sorted_hits})
+        n_stems = len(stems_per_cid[cid])
         if n_stems >= 2:
             cand_score = (n_stems, len(sorted_hits), cid)
             if best_cid == "general" or cand_score[:2] > best_score[:2]:
@@ -675,10 +838,390 @@ def _load_all_portable_conversations(
     return records
 
 
+def _compute_knn_topology(
+    unit_vecs: Sequence[tuple[float, ...]],
+    all_records: Sequence[dict],
+    high_df_tokens: set[str],
+    top_k: int = KNN_TOP_K,
+    min_cos: float = KNN_MIN_COSINE,
+) -> list[list[dict]]:
+    """Compute bounded k-NN cosine topology cleanly from N=0 up to N=10,000+ documents."""
+    n_nodes = len(all_records)
+    if n_nodes <= 1:
+        return [[] for _ in range(n_nodes)]
+
+    heaps: list[list[tuple[float, str]]] = [[] for _ in range(n_nodes)]
+    sp = _SUMPROD
+
+    if n_nodes <= 1200:
+        for i in range(n_nodes):
+            ui = unit_vecs[i]
+            id_i = all_records[i]["id"]
+            hi = heaps[i]
+            for j in range(i + 1, n_nodes):
+                cos_ij = float(sp(ui, unit_vecs[j])) if sp is not None else float(sum(map(mul, ui, unit_vecs[j])))
+                if cos_ij < min_cos:
+                    continue
+                r_cos = round(cos_ij, 4)
+                cand_i = (r_cos, all_records[j]["id"])
+                if len(hi) < top_k:
+                    heapq.heappush(hi, cand_i)
+                elif cand_i > hi[0]:
+                    heapq.heapreplace(hi, cand_i)
+                hj = heaps[j]
+                cand_j = (r_cos, id_i)
+                if len(hj) < top_k:
+                    heapq.heappush(hj, cand_j)
+                elif cand_j > hj[0]:
+                    heapq.heapreplace(hj, cand_j)
+    else:
+        # Large corpus path: single-pass top-magnitude dim index + IDF-sorted token postings + 64-bit packed pair dedup
+        dim = len(unit_vecs[0]) if unit_vecs[0] else VECTOR_DIM
+        dim_postings: list[list[int]] = [[] for _ in range(dim)]
+        top_dims_by_doc: list[list[int]] = []
+        for idx, ui in enumerate(unit_vecs):
+            active_d = [d for d, val in enumerate(ui) if val >= 0.085 or val <= -0.085][:5]
+            top_dims_by_doc.append(active_d)
+            for d in active_d:
+                dim_postings[d].append(idx)
+
+        tok_postings: dict[str, list[int]] = {}
+        for idx, rec in enumerate(all_records):
+            for tok in rec["tokens"]:
+                if tok not in high_df_tokens:
+                    lst = tok_postings.get(tok)
+                    if lst is None:
+                        tok_postings[tok] = [idx]
+                    else:
+                        lst.append(idx)
+
+        ids = [rec["id"] for rec in all_records]
+        seen_pairs: set[int] = set()
+        for i in range(n_nodes):
+            cands: list[int] = []
+            cand_set: set[int] = {i}
+
+            # Prioritize rarest (highest-IDF) token buckets first, stride-sampled across full bucket
+            tok_lists = [
+                tok_postings[t]
+                for t in all_records[i]["tokens"]
+                if t in tok_postings and len(tok_postings[t]) >= 2
+            ]
+            tok_lists.sort(key=len)
+            for lst in tok_lists[:4]:
+                ln = len(lst)
+                if ln <= 10:
+                    for j in lst:
+                        if j not in cand_set:
+                            cand_set.add(j)
+                            cands.append(j)
+                else:
+                    stride = ln // 10
+                    taken = 0
+                    for pos in range(i % stride, ln, stride):
+                        j = lst[pos]
+                        if j not in cand_set:
+                            cand_set.add(j)
+                            cands.append(j)
+                        taken += 1
+                        if taken >= 10:
+                            break
+                if len(cands) >= 28:
+                    break
+
+            # Fill with rarest active top-magnitude dimension postings only when token candidates are sparse
+            if len(cands) < 14:
+                dim_lists = sorted(
+                    (dim_postings[d] for d in top_dims_by_doc[i] if len(dim_postings[d]) >= 2),
+                    key=len,
+                )
+                for lst in dim_lists:
+                    ln = len(lst)
+                    if ln <= 10:
+                        for j in lst:
+                            if j not in cand_set:
+                                cand_set.add(j)
+                                cands.append(j)
+                    else:
+                        stride = ln // 10
+                        taken = 0
+                        for pos in range(i % stride, ln, stride):
+                            j = lst[pos]
+                            if j not in cand_set:
+                                cand_set.add(j)
+                                cands.append(j)
+                            taken += 1
+                            if taken >= 10:
+                                break
+                    if len(cands) >= 28:
+                        break
+
+            ui = unit_vecs[i]
+            id_i = ids[i]
+            hi = heaps[i]
+            for j in cands:
+                a, b = (i, j) if i < j else (j, i)
+                pair_key = (a << 32) | b
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                cos_ij = float(sp(ui, unit_vecs[j])) if sp is not None else float(sum(map(mul, ui, unit_vecs[j])))
+                if cos_ij < min_cos:
+                    continue
+                r_cos = round(cos_ij, 4)
+                cand_i = (r_cos, ids[j])
+                if len(hi) < top_k:
+                    heapq.heappush(hi, cand_i)
+                elif cand_i > hi[0]:
+                    heapq.heapreplace(hi, cand_i)
+                hj = heaps[j]
+                cand_j = (r_cos, id_i)
+                if len(hj) < top_k:
+                    heapq.heappush(hj, cand_j)
+                elif cand_j > hj[0]:
+                    heapq.heapreplace(hj, cand_j)
+
+    knn_by_idx: list[list[dict]] = []
+    for h in heaps:
+        h.sort(reverse=True)
+        knn_by_idx.append([{"id": cid, "cos": c} for c, cid in h[:top_k]])
+    return knn_by_idx
+
+
+def _supports_idf_weights() -> bool:
+    try:
+        return "idf_weights" in inspect.signature(compute_semantic_vector).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+_CLUSTER_LABEL_NOISE_WORDS: frozenset[str] = frozenset({
+    "href", "http", "https", "www", "com", "org", "edu", "html", "quot", "amp",
+    "reuters", "ap", "afp", "inc", "corp", "ltd", "anyone", "someone", "everyone",
+    "says", "said", "told", "wrote", "writes", "article", "post", "posted",
+    "subject", "organization", "lines", "nntp", "posting", "host", "university",
+    "year", "years", "week", "month", "time", "day", "days", "night",
+    "people", "person", "good", "better", "best", "new", "first", "two", "one",
+    "also", "many", "much", "even", "well", "make", "made", "know", "think",
+    "present", "based", "using", "used", "use", "system", "systems", "general",
+    "information", "service", "services", "program", "programs", "number", "world",
+    "state", "states", "national", "group", "work", "way", "case", "set", "high",
+    "large", "small", "long", "right", "left", "place", "paper", "life",
+    "company", "companies", "million", "billion", "percent", "last", "next",
+    "back", "still", "take", "taken", "including", "according", "report",
+    "reported", "officials", "ago", "monday", "tuesday", "wednesday", "thursday",
+    "friday", "saturday", "sunday",
+})
+
+
+def _cluster_general_docs_kmeans(
+    general_indices: Sequence[int],
+    unit_vecs: Sequence[tuple[float, ...]],
+    all_records: Sequence[dict],
+    n_corpus: int,
+    df: dict[str, int],
+    high_df_tokens: set[str],
+    max_iter: int = 5,
+) -> tuple[dict[int, str], list[str]]:
+    """Run deterministic pure-stdlib spherical k-means on unclustered 'general' docs and name via TF-IDF."""
+    n_gen = len(general_indices)
+    n_total = len(all_records)
+    if n_gen < 2:
+        return {}, []
+
+    k = min(18, max(6, int(math.sqrt(n_total / 25.0))))
+    k = min(k, n_gen)
+    if k <= 1:
+        return {}, []
+
+    dim = len(unit_vecs[general_indices[0]]) if unit_vecs[general_indices[0]] else VECTOR_DIM
+    gen_vecs = [unit_vecs[idx] for idx in general_indices]
+    sp = _SUMPROD
+
+    # When N_gen is large, fit spherical k-means centroids on a deterministic strided subsample (<= 500)
+    # then assign all N_gen vectors in a single pass for sub-second O(N * K) scaling.
+    fit_cap = 500
+    if n_gen > fit_cap:
+        step_km = n_gen / float(fit_cap)
+        fit_vecs = [gen_vecs[int(i * step_km)] for i in range(fit_cap)]
+    else:
+        fit_vecs = gen_vecs
+    n_fit = len(fit_vecs)
+
+    # Deterministic farthest-first centroid initialization
+    seed0 = next((m for m, gv in enumerate(fit_vecs) if any(abs(x) > 1e-12 for x in gv)), 0)
+    centroids: list[tuple[float, ...]] = [fit_vecs[seed0]]
+    max_sim = [
+        float(sp(gv, centroids[0])) if sp is not None else float(sum(map(mul, gv, centroids[0])))
+        for gv in fit_vecs
+    ]
+    for _ in range(1, k):
+        farthest_m = min(range(n_fit), key=lambda m: max_sim[m])
+        c_new = fit_vecs[farthest_m]
+        centroids.append(c_new)
+        for m, gv in enumerate(fit_vecs):
+            s = float(sp(gv, c_new)) if sp is not None else float(sum(map(mul, gv, c_new)))
+            if s > max_sim[m]:
+                max_sim[m] = s
+
+    fit_assignments = [0] * n_fit
+    move_tol = max(1, n_fit // 200)
+    for _ in range(max_iter):
+        changed = 0
+        best_sims = [0.0] * n_fit
+        sums = [[0.0] * dim for _ in range(k)]
+        counts = [0] * k
+
+        for m, gv in enumerate(fit_vecs):
+            best_c = 0
+            best_s = -2.0
+            for c_idx, cent in enumerate(centroids):
+                s = float(sp(gv, cent)) if sp is not None else float(sum(map(mul, gv, cent)))
+                if s > best_s:
+                    best_s = s
+                    best_c = c_idx
+            if fit_assignments[m] != best_c:
+                changed += 1
+                fit_assignments[m] = best_c
+            best_sims[m] = best_s
+            counts[best_c] += 1
+            acc = sums[best_c]
+            for j in range(dim):
+                acc[j] += gv[j]
+
+        new_centroids: list[tuple[float, ...]] = []
+        for c_idx in range(k):
+            if counts[c_idx] > 0:
+                new_centroids.append(_to_unit_tuple(sums[c_idx]))
+            else:
+                reseed_m = min(range(n_fit), key=lambda m: best_sims[m])
+                fit_assignments[reseed_m] = c_idx
+                best_sims[reseed_m] = 1.0
+                new_centroids.append(fit_vecs[reseed_m])
+        centroids = new_centroids
+        if changed <= move_tol:
+            break
+
+    if n_gen > fit_cap:
+        assignments = [0] * n_gen
+        for m, gv in enumerate(gen_vecs):
+            best_c = 0
+            best_s = -2.0
+            for c_idx, cent in enumerate(centroids):
+                s = float(sp(gv, cent)) if sp is not None else float(sum(map(mul, gv, cent)))
+                if s > best_s:
+                    best_s = s
+                    best_c = c_idx
+            assignments[m] = best_c
+    else:
+        assignments = fit_assignments
+
+    members_by_c: list[list[int]] = [[] for _ in range(k)]
+    for m, c_idx in enumerate(assignments):
+        members_by_c[c_idx].append(general_indices[m])
+
+    # Name each non-empty cluster as "topic:<top1>_<top2>" via contrastive cluster specificity
+    cluster_meta: list[tuple[int, str, list[int]]] = []
+    used_names: set[str] = set()
+    used_primary_stems: set[str] = set()
+    ordered_c = sorted(range(k), key=lambda c: (-len(members_by_c[c]), c))
+
+    for c_idx in ordered_c:
+        members = members_by_c[c_idx]
+        if not members:
+            continue
+        cluster_df_clean: dict[str, int] = {}
+        cluster_df_all: dict[str, int] = {}
+        for doc_idx in members:
+            for tok in set(all_records[doc_idx]["tokens"]):
+                if tok in high_df_tokens or len(tok) < 3 or tok.isdigit():
+                    continue
+                cluster_df_all[tok] = cluster_df_all.get(tok, 0) + 1
+                if tok not in _CLUSTER_LABEL_NOISE_WORDS:
+                    cluster_df_clean[tok] = cluster_df_clean.get(tok, 0) + 1
+
+        cluster_df = cluster_df_clean if cluster_df_clean else cluster_df_all
+        min_df_in_cluster = max(2, len(members) // 25)
+        thresholds = [min_df_in_cluster]
+        if min_df_in_cluster > 2:
+            thresholds.append(2)
+        if min_df_in_cluster > 1:
+            thresholds.append(1)
+
+        scored: list[tuple[float, int, str]] = []
+        for thresh in thresholds:
+            for tok, c_df in cluster_df.items():
+                if c_df < thresh:
+                    continue
+                idf = _bm25_idf(tok, n_corpus, df, high_df_tokens)
+                global_df = max(1, df.get(tok, c_df))
+                specificity = c_df * idf * ((c_df / float(global_df)) ** 0.75)
+                scored.append((specificity, c_df, tok))
+            if scored:
+                break
+
+        scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        chosen_candidates: list[tuple[str, str]] = []
+        chosen_stems: set[str] = set()
+        for _, _, tok in scored:
+            st = stem_token(tok)
+            if st in chosen_stems:
+                continue
+            slug = re.sub(r"[^a-z0-9]+", "", tok.lower())
+            if len(slug) < 2:
+                continue
+            chosen_stems.add(st)
+            chosen_candidates.append((slug[:20], st))
+            if len(chosen_candidates) >= 8:
+                break
+
+        if len(chosen_candidates) >= 2:
+            primary_idx = next(
+                (i for i, (_, st) in enumerate(chosen_candidates) if st not in used_primary_stems),
+                0,
+            )
+            primary_slug, primary_stem = chosen_candidates[primary_idx]
+            cand_name = ""
+            for sec_idx, (sec_slug, _) in enumerate(chosen_candidates):
+                if sec_idx == primary_idx:
+                    continue
+                probe = f"topic:{primary_slug}_{sec_slug}"
+                if probe not in used_names:
+                    cand_name = probe
+                    break
+            if not cand_name:
+                sec_idx = 1 if primary_idx == 0 else 0
+                cand_name = f"topic:{primary_slug}_{chosen_candidates[sec_idx][0]}"
+            used_primary_stems.add(primary_stem)
+        elif len(chosen_candidates) == 1:
+            primary_slug, primary_stem = chosen_candidates[0]
+            used_primary_stems.add(primary_stem)
+            cand_name = f"topic:{primary_slug}"
+        else:
+            cand_name = f"topic:cluster_{c_idx + 1}"
+
+        final_name = cand_name
+        suffix = 2
+        while final_name in used_names:
+            final_name = f"{cand_name}_{suffix}"
+            suffix += 1
+        used_names.add(final_name)
+        cluster_meta.append((len(members), final_name, members))
+
+    assignments_out: dict[int, str] = {}
+    dynamic_names: list[str] = []
+    for _, cname, members in cluster_meta:
+        dynamic_names.append(cname)
+        for doc_idx in members:
+            assignments_out[doc_idx] = cname
+
+    return assignments_out, dynamic_names
+
+
 def collect_vector_corpus(
     home: Path | None = None,
     state_home: Path | None = None,
-    max_docs: int = 500,
+    max_docs: int = 5000,
     agy_db_path: Path | None = None,
     index_db_path: Path | None = None,
     custom_synonyms: dict[str, list[str]] | None = None,
@@ -750,6 +1293,26 @@ def collect_vector_corpus(
         rec["id"]: set(rec["tokens"]) for rec in all_records
     }
     n_corpus, df, high_df_tokens = _compute_corpus_stats(doc_tokens_by_cid, len(doc_tokens_by_cid))
+    idf_weights: dict[str, float] = {
+        tok: _bm25_idf(tok, n_corpus, df, high_df_tokens)
+        for tok in df
+        if tok not in high_df_tokens
+    }
+
+    if all_records:
+        for rec in all_records:
+            existing_vec = rec.get("vector")
+            if not existing_vec or len(existing_vec) != VECTOR_DIM:
+                active_toks = (
+                    [t for t in rec["tokens"] if t not in high_df_tokens]
+                    if high_df_tokens
+                    else rec["tokens"]
+                ) or rec["tokens"]
+                rec["vector"] = compute_semantic_vector(active_toks, custom_synonyms=syns)
+            elif high_df_tokens:
+                active_toks = [t for t in rec["tokens"] if t not in high_df_tokens]
+                if active_toks and len(active_toks) < len(rec["tokens"]):
+                    rec["vector"] = compute_semantic_vector(active_toks, custom_synonyms=syns)
 
     vectors = [rec["vector"] for rec in all_records]
     pca = fit_pca_3d(vectors)
@@ -758,68 +1321,113 @@ def collect_vector_corpus(
     pca_basis = pca["basis"]
     variance_explained = pca["variance_explained"]
 
-    # Precompute pairwise 256-dim cosine similarity for k-NN edges
+    # Precompute unit vectors once + pairwise 256-dim cosine k-NN edges
+    unit_vecs = [_to_unit_tuple(v) for v in vectors]
+    knn_by_idx = _compute_knn_topology(unit_vecs, all_records, high_df_tokens)
+
+    # First pass: concept cluster matching via DEFAULT_CONCEPT_CLUSTERS + custom synonyms
+    merged_clusters, term_to_concepts = build_concept_lookup(syns)
+    stem_cache: dict[str, str] = {}
+    dom_concepts: list[str] = []
+    concepts_maps: list[dict[str, list[str]]] = []
+    general_indices: list[int] = []
+    for idx, rec in enumerate(all_records):
+        dom, cmap = _select_dominant_concept(
+            rec["tokens"],
+            syns,
+            term_to_concepts=term_to_concepts,
+            stem_cache=stem_cache,
+        )
+        dom_concepts.append(dom)
+        concepts_maps.append(cmap)
+        if dom == "general":
+            general_indices.append(idx)
+
+    # Dynamic spherical k-means fallback when >75% of corpus (>= 12 docs) collapses into "general"
+    dynamic_cluster_names: list[str] = []
     n_nodes = len(all_records)
-    knn_by_idx: list[list[dict]] = [[] for _ in range(n_nodes)]
-    for i in range(n_nodes):
-        vi = vectors[i]
-        candidates: list[tuple[float, str]] = []
-        for j in range(n_nodes):
-            if i == j:
-                continue
-            cos_ij = cosine_similarity(vi, vectors[j])
-            if cos_ij >= KNN_MIN_COSINE:
-                candidates.append((round(cos_ij, 4), all_records[j]["id"]))
-        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        knn_by_idx[i] = [{"id": cid, "cos": c} for c, cid in candidates[:KNN_TOP_K]]
+    if n_nodes >= 12 and (len(general_indices) / n_nodes) > 0.75:
+        dyn_assignments, dynamic_cluster_names = _cluster_general_docs_kmeans(
+            general_indices,
+            unit_vecs,
+            all_records,
+            n_corpus,
+            df,
+            high_df_tokens,
+        )
+        for idx, dyn_name in dyn_assignments.items():
+            dom_concepts[idx] = dyn_name
 
     nodes: list[dict] = []
+    node_details_by_id: dict[str, dict] = {}
     vectors_by_id: dict[str, list[float]] = {}
+    unit_vectors_by_id: dict[str, tuple[float, ...]] = {}
     cluster_positions: dict[str, list[list[float]]] = {}
+    idf_rounded = {tok: round(val, 4) for tok, val in idf_weights.items()}
 
     for idx, rec in enumerate(all_records):
         cid = rec["id"]
         doc_tokens = rec["tokens"]
         title_tokens = set(tokenize_domain(rec["title"]))
-        dominant_concept, concepts_map = _select_dominant_concept(doc_tokens, syns)
+        dominant_concept = dom_concepts[idx]
+        concepts_map = concepts_maps[idx]
 
         scored_tokens: list[tuple[tuple[float, int, int, str], str]] = []
         for tok in doc_tokens:
             if tok in high_df_tokens:
                 continue
-            idf_val = _bm25_idf(tok, n_corpus, df, high_df_tokens)
+            r_idf = idf_rounded.get(tok)
+            if r_idf is None:
+                r_idf = round(_bm25_idf(tok, n_corpus, df, high_df_tokens), 4)
             in_title = 1 if tok in title_tokens else 0
-            scored_tokens.append(((round(idf_val, 4), in_title, min(len(tok), 16), tok), tok))
-        scored_tokens.sort(key=lambda item: item[0], reverse=True)
-        top_tokens = [tok for _, tok in scored_tokens[:TOP_TOKENS_PER_DOC]]
+            scored_tokens.append(((r_idf, in_title, min(len(tok), 16), tok), tok))
+        top_tokens = [tok for _, tok in heapq.nlargest(TOP_TOKENS_PER_DOC, scored_tokens, key=lambda item: item[0])]
         if not top_tokens:
             top_tokens = list(doc_tokens[:TOP_TOKENS_PER_DOC])
 
         pos = coords_3d[idx] if idx < len(coords_3d) else [0.0, 0.0, 0.0]
         vec = rec["vector"]
+        vec_preview = compute_vector_preview(vec, buckets=VECTOR_PREVIEW_BUCKETS)
+        summary_clean = clean_snippet(rec["summary"], 220)
         vectors_by_id[cid] = vec
+        unit_vectors_by_id[cid] = unit_vecs[idx]
         cluster_positions.setdefault(dominant_concept, []).append(pos)
 
-        nodes.append(
-            {
-                "id": cid,
-                "provider": rec["provider"],
-                "title": rec["title"],
-                "last_modified_time": rec["last_modified_time"],
-                "step_count": int(rec["step_count"]),
-                "summary": clean_snippet(rec["summary"], 220),
-                "dominant_concept": dominant_concept,
-                "concepts": concepts_map,
-                "top_tokens": top_tokens,
-                "vector_preview": compute_vector_preview(vec, buckets=VECTOR_PREVIEW_BUCKETS),
-                "pos": pos,
-                "knn": knn_by_idx[idx],
-            }
-        )
+        node_obj = {
+            "id": cid,
+            "provider": rec["provider"],
+            "title": rec["title"],
+            "last_modified_time": rec["last_modified_time"],
+            "step_count": int(rec["step_count"]),
+            "summary": summary_clean,
+            "dominant_concept": dominant_concept,
+            "concepts": concepts_map,
+            "top_tokens": top_tokens,
+            "vector_preview": vec_preview,
+            "pos": pos,
+            "knn": knn_by_idx[idx],
+        }
+        nodes.append(node_obj)
+        node_details_by_id[cid] = {
+            "id": cid,
+            "provider": rec["provider"],
+            "title": rec["title"],
+            "last_modified_time": rec["last_modified_time"],
+            "step_count": int(rec["step_count"]),
+            "dominant_concept": dominant_concept,
+            "summary": summary_clean,
+            "top_tokens": top_tokens,
+            "vector_preview": vec_preview,
+            "concepts": concepts_map,
+        }
 
-    merged_clusters, _ = build_concept_lookup(syns)
     cluster_names = list(
-        dict.fromkeys(list(DEFAULT_CONCEPT_CLUSTERS.keys()) + list(merged_clusters.keys()) + ["general"])
+        dict.fromkeys(
+            list(DEFAULT_CONCEPT_CLUSTERS.keys())
+            + list(merged_clusters.keys())
+            + dynamic_cluster_names
+            + ["general"]
+        )
     )
 
     centroids: list[dict] = []
@@ -852,7 +1460,10 @@ def collect_vector_corpus(
     return {
         **public_graph,
         "public_graph": public_graph,
+        "node_details_by_id": node_details_by_id,
         "vectors_by_id": vectors_by_id,
+        "unit_vectors_by_id": unit_vectors_by_id,
+        "idf_weights": idf_weights,
         "pca_mean": pca_mean,
         "pca_basis": pca_basis,
         "pca_scale": pca["scale"],
@@ -866,8 +1477,26 @@ def collect_vector_corpus(
 
 
 def build_public_graph(state: dict, live_api: bool = True) -> dict:
-    """Extract the clean JSON-serializable public graph dictionary from `state`."""
+    """Extract the clean JSON-serializable public graph dictionary from `state`.
+
+    When `live_api=True` and `len(nodes) > 400`, omits heavy per-node inspector fields
+    (`summary`, `top_tokens`, `vector_preview`, `concepts`) so `/api/graph` and initial HTML
+    remain compact while `/api/node?id=<cid>` hydrates inspector details lazily on click.
+    """
     base = state.get("public_graph") if isinstance(state.get("public_graph"), dict) else state
+    raw_nodes = list(base.get("nodes", []))
+    if live_api and len(raw_nodes) > 400:
+        nodes_out = [
+            {
+                k: v
+                for k, v in node.items()
+                if k not in ("summary", "top_tokens", "vector_preview", "concepts")
+            }
+            for node in raw_nodes
+        ]
+    else:
+        nodes_out = raw_nodes
+
     return {
         "version": str(base.get("version", VECTOR_CACHE_VERSION)),
         "live_api": bool(live_api),
@@ -876,7 +1505,7 @@ def build_public_graph(state: dict, live_api: bool = True) -> dict:
         "cluster_names": list(
             base.get("cluster_names", list(DEFAULT_CONCEPT_CLUSTERS.keys()) + ["general"])
         ),
-        "nodes": list(base.get("nodes", [])),
+        "nodes": nodes_out,
         "centroids": list(base.get("centroids", [])),
     }
 
@@ -912,7 +1541,14 @@ def query_rag_space(
         for k, v in raw_q_concepts.items()
     }
 
-    q_vec = compute_semantic_vector(q_tokens, custom_synonyms=syns) if q_tokens else [0.0] * VECTOR_DIM
+    idf_weights = state.get("idf_weights") if isinstance(state.get("idf_weights"), dict) else None
+    if q_tokens:
+        if idf_weights and _supports_idf_weights():
+            q_vec = compute_semantic_vector(q_tokens, custom_synonyms=syns, idf_weights=idf_weights)
+        else:
+            q_vec = compute_semantic_vector(q_tokens, custom_synonyms=syns)
+    else:
+        q_vec = [0.0] * VECTOR_DIM
     q_vector_preview = compute_vector_preview(q_vec, buckets=VECTOR_PREVIEW_BUCKETS)
 
     pca_mean = state.get("pca_mean") or ([0.0] * VECTOR_DIM)
@@ -941,17 +1577,23 @@ def query_rag_space(
         custom_synonyms=syns,
     )
 
+    unit_vectors_by_id: dict[str, tuple[float, ...]] = state.get("unit_vectors_by_id") or {}
     vectors_by_id: dict[str, list[float]] = state.get("vectors_by_id") or {}
     nodes: list[dict] = state.get("nodes") or []
     nearest_cos: list[dict] = []
     if q_tokens:
+        q_unit = _to_unit_tuple(q_vec)
         cos_scored: list[tuple[float, str, str]] = []
         for node in nodes:
             nid = str(node.get("id", ""))
-            d_vec = vectors_by_id.get(nid)
-            if not d_vec:
-                continue
-            c = round(max(0.0, cosine_similarity(q_vec, d_vec)), 4)
+            u_vec = unit_vectors_by_id.get(nid)
+            if u_vec is not None:
+                c = round(max(0.0, float(sum(map(mul, q_unit, u_vec)))), 4)
+            else:
+                d_vec = vectors_by_id.get(nid)
+                if not d_vec:
+                    continue
+                c = round(max(0.0, cosine_similarity(q_vec, d_vec)), 4)
             if c > 0.0:
                 cos_scored.append((c, nid, str(node.get("title", ""))))
         cos_scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
@@ -1030,7 +1672,8 @@ def make_visualizer_handler(state: dict):
             self._send_bytes(status, "application/json; charset=utf-8", raw)
 
         def do_GET(self) -> None:
-            path = self.path.split("?", 1)[0]
+            parsed = urlsplit(self.path)
+            path = parsed.path
             if path in ("/", "/index.html"):
                 graph_payload = build_public_graph(state, live_api=True)
                 html = _render_html_with_ui(json.dumps(graph_payload, separators=(",", ":")), live_api=True)
@@ -1045,6 +1688,43 @@ def make_visualizer_handler(state: dict):
             if path == "/api/graph":
                 graph_payload = build_public_graph(state, live_api=True)
                 self._send_json(200, graph_payload)
+                return
+            if path == "/api/node":
+                qs = parse_qs(parsed.query, keep_blank_values=False)
+                cid_vals = qs.get("id")
+                cid = cid_vals[0] if cid_vals else ""
+                if not cid:
+                    self._send_json(404, {"error": "Node not found", "id": ""})
+                    return
+                details_map = state.get("node_details_by_id")
+                detail: dict | None = None
+                if isinstance(details_map, dict):
+                    detail = details_map.get(cid)
+                if detail is None:
+                    raw_nodes = state.get("nodes") or (
+                        state.get("public_graph", {}).get("nodes")
+                        if isinstance(state.get("public_graph"), dict)
+                        else []
+                    ) or []
+                    for cand in raw_nodes:
+                        if isinstance(cand, dict) and cand.get("id") == cid:
+                            detail = {
+                                "id": cid,
+                                "provider": cand.get("provider", "generic"),
+                                "title": cand.get("title", ""),
+                                "last_modified_time": cand.get("last_modified_time", ""),
+                                "step_count": int(cand.get("step_count", 0)),
+                                "dominant_concept": cand.get("dominant_concept", "general"),
+                                "summary": cand.get("summary", ""),
+                                "top_tokens": list(cand.get("top_tokens", [])),
+                                "vector_preview": list(cand.get("vector_preview", [])),
+                                "concepts": dict(cand.get("concepts", {})),
+                            }
+                            break
+                if detail is None:
+                    self._send_json(404, {"error": "Node not found", "id": cid})
+                    return
+                self._send_json(200, detail)
                 return
             self._send_json(404, {"error": "Not found"})
 
@@ -1189,8 +1869,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--max-docs",
         type=int,
-        default=500,
-        help="Maximum parent conversations to project into 3D space (default: 500)",
+        default=5000,
+        help="Maximum parent conversations to project into 3D space (default: 5000)",
     )
     parser.add_argument(
         "--export",
