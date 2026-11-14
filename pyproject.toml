@@ -20,6 +20,7 @@ v1-recall = "v1_memory.recall:main"
 v1-sync = "v1_memory.cloud_sync:main_sync"
 v1-status = "v1_memory.cloud_sync:main_status"
 v1-mcp = "v1_memory.mcp_server:main"
+v1-viz = "v1_memory.visualizer:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

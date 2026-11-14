@@ -10,8 +10,11 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -1242,8 +1245,115 @@ class V1MemoryTests(unittest.TestCase):
         )
         elapsed = time.perf_counter() - t0
         self.assertLess(elapsed, 2.0)
+        self.assertIsNotNone(matches)
         self.assertTrue(matches)
         self.assertEqual(matches[0]["conversation_id"], "codex:fdcan-boot-02")
+
+    def test_visualizer_pca_corpus_export_and_live_server(self) -> None:
+        from v1_memory.visualizer import (
+            collect_vector_corpus,
+            create_visualizer_server,
+            export_static_html,
+            fit_pca_3d,
+            project_vector_3d,
+            query_rag_space,
+        )
+
+        # Edge cases N=0, N=1, N=2
+        pca0 = fit_pca_3d([])
+        self.assertEqual(pca0["coords"], [])
+        self.assertEqual(pca0["variance_explained"], [0.0, 0.0, 0.0])
+
+        pca1 = fit_pca_3d([compute_semantic_vector(["mavlink", "telemetry"])])
+        self.assertEqual(pca1["coords"], [[0.0, 0.0, 0.0]])
+
+        pca2 = fit_pca_3d([
+            compute_semantic_vector(["mavlink", "telemetry"]),
+            compute_semantic_vector(["postgresql", "schema"]),
+        ])
+        self.assertEqual(len(pca2["coords"]), 2)
+        for pt in pca2["coords"]:
+            self.assertEqual(len(pt), 3)
+            for coord in pt:
+                self.assertGreaterEqual(coord, -1.0001)
+                self.assertLessEqual(coord, 1.0001)
+
+        # Collect corpus from isolated fixture workspace (2 portable fixtures from setUp)
+        state = collect_vector_corpus(home=self.home, state_home=self.state_home, max_docs=50)
+        nodes = state["public_graph"]["nodes"]
+        self.assertEqual(len(nodes), 2)
+        self.assertTrue(all(len(n["pos"]) == 3 for n in nodes))
+        self.assertTrue(all(len(n["vector_preview"]) == 64 for n in nodes))
+
+        q_proj = project_vector_3d(
+            compute_semantic_vector(["sx1262", "telemetry"]),
+            state["pca_mean"],
+            state["pca_basis"],
+        )
+        self.assertEqual(len(q_proj), 3)
+
+        # Query Hybrid-RAG vs Sparse-Only
+        q_res = query_rag_space("wireless 915MHz telemetry packet", state, threshold_pct=20.0, hybrid_rag=True)
+        self.assertIn("q_pos", q_res)
+        self.assertEqual(len(q_res["q_pos"]), 3)
+        self.assertIn("matches", q_res)
+        self.assertTrue(any(m["conversation_id"] == "claude:radio-link-01" for m in q_res["matches"]))
+
+        # Static offline HTML export + XSS escape check
+        xss_state = collect_vector_corpus(home=self.home, state_home=self.state_home, max_docs=50)
+        xss_state["public_graph"]["nodes"][0]["title"] = '</script><script>alert(1)</script>'
+        out_html = Path(self.tmp.name) / "viz_export.html"
+        exported = export_static_html(out_html, state=xss_state)
+        self.assertTrue(exported.exists())
+        html_text = exported.read_text(encoding="utf-8")
+        self.assertNotIn("<script>alert(1)</script>", html_text)
+        self.assertIn("const INITIAL_LIVE_API = false;", html_text)
+        self.assertIn('rel="icon" href="data:,"', html_text)
+
+        # Live ephemeral HTTP server check (/, /favicon.ico 204, /api/graph, /api/query, 400 bad JSON)
+        httpd, port = create_visualizer_server(state, host="127.0.0.1", port=0, strict_port=True)
+        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            base = f"http://127.0.0.1:{port}"
+            with urllib.request.urlopen(f"{base}/", timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                body = resp.read().decode("utf-8")
+                self.assertIn("const INITIAL_LIVE_API = true;", body)
+
+            with urllib.request.urlopen(f"{base}/favicon.ico", timeout=5) as resp:
+                self.assertEqual(resp.status, 204)
+
+            with urllib.request.urlopen(f"{base}/api/graph", timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                graph = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(len(graph["nodes"]), 2)
+
+            req = urllib.request.Request(
+                f"{base}/api/query",
+                data=json.dumps({"query": "STM32H7 FDCAN", "threshold_pct": 25.0, "hybrid_rag": True}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                q_json = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(any(m["conversation_id"] == "codex:fdcan-boot-02" for m in q_json["matches"]))
+
+            bad_req = urllib.request.Request(
+                f"{base}/api/query",
+                data=b"{not-valid-json",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(bad_req, timeout=5)
+            self.assertEqual(ctx.exception.code, 400)
+            ctx.exception.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server_thread.join(timeout=2)
 
     def test_zero_personal_paths_or_identifiers_in_repo(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

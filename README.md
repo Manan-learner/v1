@@ -55,7 +55,14 @@ v1-recall --show "<conversation_id>"
   v1-sync --remote gdrive:AI-Agent-Memory
   ```
 
-### 4. Wire Into Your Favorite LLM Harness
+### 4. Interactive 3D Hybrid-RAG Vector Explorer (`v1-viz`)
+Launch a local zero-dependency 3D PCA vector space explorer with live Hybrid-RAG vs Sparse query beams, 256D k-NN edges, and cluster centroids, or export a self-contained offline HTML file:
+```bash
+v1-viz --port 8765
+v1-viz --export rag_3d_explorer.html
+```
+
+### 5. Wire Into Your Favorite LLM Harness
 * **Gemini Antigravity CLI:** Copy [`examples/antigravity_hooks.json`](examples/antigravity_hooks.json) into `~/.gemini/config/hooks.json`.
 * **Claude Code:** Add [`examples/claude_settings_hook.json`](examples/claude_settings_hook.json) into `~/.claude/settings.json` (`UserPromptSubmit`).
 * **Cursor / Windsurf / Cline / Codex / Claude Desktop / Any MCP Client:** Register [`examples/mcp_config.json`](examples/mcp_config.json) (`v1-mcp`).
@@ -78,6 +85,8 @@ src/v1_memory/
   recall.py          # Cross-provider search & transcript turn viewer
   cloud_sync.py      # Non-destructive WAL-safe Drive folder + rclone delta sync
   mcp_server.py      # Zero-dependency MCP stdio JSON-RPC server
+  visualizer.py      # Pure-Python 3D PCA projection, 256D k-NN graph & live query HTTP server
+  viz_ui.py          # Zero-dependency offline 3D Canvas/WebGL interactive vector explorer UI
 examples/            # Ready-to-copy hook & MCP configs
 scripts/             # Cross-OS bootstrap + daily scheduler scripts
 tests/               # Offline unit & integration test suite
