@@ -1,0 +1,12 @@
+{
+  "context-finder": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "v1-context --format antigravity",
+        "timeout": 8
+      }
+    ]
+  }
+}

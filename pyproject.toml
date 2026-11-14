@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "v1-agent-memory"
+version = "0.1.0"
+description = "Model-agnostic proactive conversation context finder and non-destructive Google Drive memory backup for AI coding CLIs (Antigravity, Claude Code, Codex CLI, MCP, and generic JSONL)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+v1-context = "v1_memory.context_finder:main"
+v1-recall = "v1_memory.recall:main"
+v1-sync = "v1_memory.cloud_sync:main_sync"
+v1-status = "v1_memory.cloud_sync:main_status"
+v1-mcp = "v1_memory.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

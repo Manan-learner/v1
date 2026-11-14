@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "v1-context --format claude",
+            "timeout": 8
+          }
+        ]
+      }
+    ]
+  }
+}
